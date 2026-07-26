@@ -40,6 +40,13 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify query "<question>" --budget 1500            # cap answer at N tokens
 /graphify path "AuthModule" "Database"                # shortest path between two concepts
 /graphify explain "SwinTransformer"                   # plain-language explanation of a node
+/graphify architecture init                             # create a versioned C4 architecture contract
+/graphify architecture sync                             # project graph facts onto the C4 contract
+/graphify architecture validate                         # check declared boundaries against observed code
+/graphify architecture view --level container           # inspect context/container/component/code level
+/graphify architecture up "src/service/auth.go"         # raise code to its C4 ancestors
+/graphify architecture down "system.back" --to code     # descend a C4 element to implementation evidence
+/graphify architecture impact "src/service/auth.go"     # roll reverse dependency impact up to C4 components
 ```
 
 ## What graphify is for
@@ -51,6 +58,8 @@ Drop any folder of code, docs, papers, images, or video into graphify and get a 
 If the user invoked `/graphify --help` or `/graphify -h` (with no other arguments), print the contents of the `## Usage` section above verbatim and stop. Do not run any commands, do not detect files, do not default the path to `.`. Just print the Usage block and return.
 
 **Fast path — existing graph:** Before doing anything else, check whether `graphify-out/graph.json` exists. The expected location is `graphify-out/graph.json` relative to the **current working directory** (i.e. the project root where you are running commands). If it exists AND the user's request is a natural-language question about the codebase (e.g. "How does X work?", "What calls Y?", "Trace the data flow through Z") and NOT an explicit rebuild command (`--update`, `--cluster-only`, or a bare path/URL that implies fresh extraction): **skip Steps 1–5 entirely and jump straight to `## For /graphify query`.** Run `graphify query "<question>"` immediately. Do not run detect. Do not check corpus size. Do not ask the user to narrow. The graph is already built — use it.
+
+**Architecture mode — C4 hierarchy and conformance:** If the user asks about architecture boundaries, complexity, C4, component ownership, dependency rules, or the impact of a change across modules, first check for `architecture/graphify.c4.json`. When it exists, run `graphify architecture validate` followed by the smallest relevant `view`, `up`, `down`, or `impact` command. Use `query` only to investigate code-level evidence after the architectural view is selected. Do not infer a C4 system or container from clustering alone: the declared model is the contract, while AST/doc evidence is the observed implementation. If no model exists, offer `graphify architecture init` and explain that it creates a reviewable starter contract rather than discovering architecture automatically.
 
 If no path was given, use `.` (current directory). Do not ask the user for a path.
 
