@@ -594,6 +594,7 @@ Commands:
   sync       project graph.json onto the declared C4 model
   validate   report model/conformance violations (exit 2 on errors)
   view       show one C4 level: --level context|container|component|code
+  html       write an interactive architecture.html browser view
   up <node>  raise a code node or C4 id to its C4 ancestors
   down <id>  descend via --to component|container|code
   impact <node-or-file>  reverse-walk dependencies and return C4 components
@@ -639,6 +640,22 @@ def dispatch_cli(args: list[str]) -> int:
                 raise ValueError("validate accepts only common path options")
             print(format_findings(projection["findings"]))
             return 2 if any(item["severity"] == "error" for item in projection["findings"]) else 0
+
+        if command == "html":
+            output = Path("graphify-out/architecture.html")
+            if not rest:
+                pass
+            elif len(rest) == 2 and rest[0] == "--output":
+                output = Path(rest[1])
+            elif len(rest) == 1 and rest[0].startswith("--output="):
+                output = Path(rest[0].split("=", 1)[1])
+            else:
+                raise ValueError("html accepts only --output PATH")
+            from graphify.architecture_html import write_architecture_html
+
+            write_architecture_html(projection, output)
+            print(f"Wrote interactive architecture view: {output}")
+            return 0
 
         if command == "view":
             level = "container"

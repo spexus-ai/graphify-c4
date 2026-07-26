@@ -138,3 +138,28 @@ def test_architecture_sync_cli_writes_sidecar_without_changing_graph(monkeypatch
     saved = json.loads(out_path.read_text(encoding="utf-8"))
     assert saved["schema"] == "graphify.architecture/v1"
     assert saved["observed_relations"][0]["source"] == "front.ui"
+
+
+def test_architecture_html_cli_writes_interactive_c4_view(monkeypatch, tmp_path, capsys):
+    model_path = tmp_path / "model.json"
+    graph_path = tmp_path / "graph.json"
+    html_path = tmp_path / "architecture.html"
+    model_path.write_text(json.dumps(MODEL), encoding="utf-8")
+    graph_path.write_text(json.dumps(GRAPH), encoding="utf-8")
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        [
+            "graphify", "architecture", "html", "--model", str(model_path), "--graph", str(graph_path),
+            "--output", str(html_path),
+        ],
+    )
+
+    mainmod.main()
+
+    assert "interactive architecture view" in capsys.readouterr().out
+    html = html_path.read_text(encoding="utf-8")
+    assert "C4 Architecture" in html
+    assert "front.ui" in html
+    assert "Click a card to drill down" in html

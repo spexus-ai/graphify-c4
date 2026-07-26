@@ -13,6 +13,7 @@ graphify architecture init
 graphify architecture sync
 graphify architecture validate
 graphify architecture view --level container
+graphify architecture html
 ```
 
 `init` refuses to overwrite an existing model. The generated file is a small
@@ -62,6 +63,8 @@ dependencies, for example a frontend container reaching any datastore:
 
 - `view` rolls observed symbol relationships to `context`, `container`,
   `component`, or `code` level.
+- `html` writes `graphify-out/architecture.html`, an offline browser view with
+  level selection and click-to-drill-down navigation.
 - `up <node>` maps a code node to its component, container, and system.
 - `down <element> --to code` returns the implementing graph node IDs.
 - `impact <node-or-file>` performs a reverse dependency walk and returns the
