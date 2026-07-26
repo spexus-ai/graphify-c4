@@ -75,6 +75,22 @@ def test_projection_rolls_code_relationships_to_c4_and_retains_evidence():
 
     assert projection["mappings"] == {"db": ["database"], "ui": ["front.ui"]}
     assert projection["unmapped_code_nodes"] == ["unmapped"]
+    assert projection["code_node_ids"] == {"db": "code:db", "ui": "code:ui"}
+    assert [element["id"] for element in projection["elements"] if element["c4_type"] == "code"] == [
+        "code:db", "code:ui"
+    ]
+    assert projection["observed_code_relations"] == [
+        {
+            "source": "code:ui",
+            "target": "code:db",
+            "kind": "calls",
+            "confidence": {"EXTRACTED": 1},
+            "evidence": [{
+                "source_node": "ui", "target_node": "db", "source_file": "src/ui/render.ts",
+                "source_location": "L14", "confidence": "EXTRACTED",
+            }],
+        }
+    ]
     assert projection["observed_relations"] == [
         {
             "source": "front.ui",
@@ -98,15 +114,42 @@ def test_conformance_reports_forbidden_undeclared_and_unmapped_code():
     assert next(finding for finding in findings if finding["kind"] == "forbidden_dependency")["rule"] == "front-no-db"
 
 
+def test_projection_keeps_intra_component_code_relationships():
+    graph = {
+        "nodes": [
+            {"id": "ui", "label": "render()", "file_type": "code", "source_file": "src/ui/render.ts"},
+            {"id": "helper", "label": "helper()", "file_type": "code", "source_file": "src/ui/helper.ts"},
+        ],
+        "links": [{"source": "ui", "target": "helper", "relation": "calls", "confidence": "EXTRACTED"}],
+    }
+
+    projection = build_projection(MODEL, graph)
+
+    assert projection["observed_relations"] == []
+    assert projection["observed_code_relations"] == [{
+        "source": "code:ui", "target": "code:helper", "kind": "calls",
+        "confidence": {"EXTRACTED": 1},
+        "evidence": [{
+            "source_node": "ui", "target_node": "helper", "source_file": "",
+            "source_location": "", "confidence": "EXTRACTED",
+        }],
+    }]
+
+
 def test_hierarchical_navigation_moves_between_code_component_container_and_context():
     projection = build_projection(MODEL, GRAPH)
 
-    assert [element["id"] for element in up(projection, "ui")] == ["front.ui", "front", "system"]
+    assert [element["id"] for element in up(projection, "ui")] == ["code:ui", "front.ui", "front", "system"]
     assert down(projection, "front", "code") == {"target": "code", "elements": ["ui"]}
     container_view = view(projection, "container")
     assert [element["id"] for element in container_view["elements"]] == ["database", "front"]
     assert container_view["observed_relations"] == [
         {"source": "front", "target": "database", "kind": "calls", "evidence_count": 1}
+    ]
+    code_view = view(projection, "code")
+    assert [element["id"] for element in code_view["elements"]] == ["code:db", "code:ui"]
+    assert code_view["observed_relations"] == [
+        {"source": "code:ui", "target": "code:db", "kind": "calls", "evidence_count": 1}
     ]
 
 
@@ -165,3 +208,4 @@ def test_architecture_html_cli_writes_interactive_c4_view(monkeypatch, tmp_path,
     assert "Architecture graph" in html
     assert "Click a node to drill down" in html
     assert "Observed code evidence" in html
+    assert "observed_code_relations" in html

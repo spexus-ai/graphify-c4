@@ -229,6 +229,11 @@ def _is_descendant(candidate: str, parent: str, elements: dict[str, dict[str, An
     return False
 
 
+def _code_element_id(node_id: str) -> str:
+    """Keep generated code IDs distinct from declared C4 element IDs."""
+    return f"code:{node_id}"
+
+
 def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
     """Map observed graph nodes and relationships onto a declared C4 model."""
     elements_list = model["elements"]
@@ -258,7 +263,26 @@ def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, 
     }
     unmapped = sorted(production_nodes - mapped_nodes)
 
+    code_node_ids = {
+        node_id: _code_element_id(node_id)
+        for node_id in sorted(production_nodes & mapped_nodes)
+    }
+    code_elements = [
+        {
+            "id": code_node_ids[node_id],
+            "c4_type": "code",
+            "parent": mappings[node_id][0],
+            "name": str(node.get("label") or node_id),
+            "source": "observed",
+            "source_file": _normalise_path(node.get("source_file")),
+            "graph_node_id": node_id,
+        }
+        for node_id, node in sorted(scoped_nodes.items())
+        if node_id in code_node_ids
+    ]
+
     observed: dict[tuple[str, str, str], dict[str, Any]] = {}
+    observed_code: dict[tuple[str, str, str], dict[str, Any]] = {}
     for link in _links(graph):
         source = str(link.get("_src") or link.get("source") or "")
         target = str(link.get("_tgt") or link.get("target") or "")
@@ -267,9 +291,31 @@ def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, 
         if len(source_mapping) != 1 or len(target_mapping) != 1:
             continue
         source_component, target_component = source_mapping[0], target_mapping[0]
+        relation = str(link.get("relation") or "uses")
+        evidence = {
+            "source_node": source,
+            "target_node": target,
+            "source_file": link.get("source_file", ""),
+            "source_location": link.get("source_location", ""),
+            "confidence": link.get("confidence", "EXTRACTED"),
+        }
+        if source in code_node_ids and target in code_node_ids:
+            code_key = (code_node_ids[source], code_node_ids[target], relation)
+            code_item = observed_code.setdefault(
+                code_key,
+                {
+                    "source": code_node_ids[source],
+                    "target": code_node_ids[target],
+                    "kind": relation,
+                    "evidence": [],
+                    "confidence": Counter(),
+                },
+            )
+            code_item["evidence"].append(evidence)
+            code_item["confidence"][str(evidence["confidence"])] += 1
+
         if source_component == target_component:
             continue
-        relation = str(link.get("relation") or "uses")
         key = (source_component, target_component, relation)
         item = observed.setdefault(
             key,
@@ -281,16 +327,8 @@ def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, 
                 "confidence": Counter(),
             },
         )
-        item["evidence"].append(
-            {
-                "source_node": source,
-                "target_node": target,
-                "source_file": link.get("source_file", ""),
-                "source_location": link.get("source_location", ""),
-                "confidence": link.get("confidence", "EXTRACTED"),
-            }
-        )
-        item["confidence"][str(link.get("confidence", "EXTRACTED"))] += 1
+        item["evidence"].append(evidence)
+        item["confidence"][str(evidence["confidence"])] += 1
 
     observed_relations = []
     for item in observed.values():
@@ -301,15 +339,26 @@ def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, 
         observed_relations.append(item)
     observed_relations.sort(key=lambda relation: (relation["source"], relation["target"], relation["kind"]))
 
+    observed_code_relations = []
+    for item in observed_code.values():
+        item["evidence"].sort(key=lambda evidence: (
+            str(evidence["source_file"]), str(evidence["source_location"]), str(evidence["source_node"])
+        ))
+        item["confidence"] = dict(sorted(item["confidence"].items()))
+        observed_code_relations.append(item)
+    observed_code_relations.sort(key=lambda relation: (relation["source"], relation["target"], relation["kind"]))
+
     return {
         "schema": SCHEMA,
-        "elements": elements_list,
+        "elements": elements_list + code_elements,
         "declared_relations": model.get("relations", []),
         "rules": model.get("rules", []),
         "mappings": {node_id: mapped for node_id, mapped in sorted(mappings.items())},
+        "code_node_ids": code_node_ids,
         "unmapped_code_nodes": unmapped,
         "ambiguous_code_nodes": sorted(ambiguous),
         "observed_relations": observed_relations,
+        "observed_code_relations": observed_code_relations,
     }
 
 
@@ -389,7 +438,8 @@ def view(projection: dict[str, Any], level: str, focus: str | None = None) -> di
     selected_ids = {element["id"] for element in selected}
 
     rolled: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for relation in projection["observed_relations"]:
+    relations = projection.get("observed_code_relations", []) if level == "code" else projection["observed_relations"]
+    for relation in relations:
         source = _ancestor(relation["source"], elements, LEVEL_TYPES[level])
         target = _ancestor(relation["target"], elements, LEVEL_TYPES[level])
         if source is None or target is None or source == target:
@@ -414,6 +464,9 @@ def resolve_architecture_node(projection: dict[str, Any], value: str) -> str | N
     elements = _element_index(projection)
     if value in elements:
         return value
+    code_node_id = projection.get("code_node_ids", {}).get(value)
+    if isinstance(code_node_id, str) and code_node_id in elements:
+        return code_node_id
     mapping = projection.get("mappings", {}).get(value, [])
     if len(mapping) == 1:
         return mapping[0]

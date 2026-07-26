@@ -62,7 +62,9 @@ dependencies, for example a frontend container reaching any datastore:
 ## Navigation and evidence
 
 - `view` rolls observed symbol relationships to `context`, `container`,
-  `component`, or `code` level.
+  `component`, or `code` level. During `sync`, mapped code nodes become
+  generated `code:<graph-node-id>` children of their component; the contract
+  itself remains compact and declares only architectural boundaries.
 - `html` writes `graphify-out/architecture.html`, an offline browser view with
   an interactive C4 relationship graph, level selection and click-to-drill-down
   navigation. Declared relations are solid green arrows; code-derived evidence
