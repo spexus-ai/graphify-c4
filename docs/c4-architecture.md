@@ -64,7 +64,9 @@ dependencies, for example a frontend container reaching any datastore:
 - `view` rolls observed symbol relationships to `context`, `container`,
   `component`, or `code` level.
 - `html` writes `graphify-out/architecture.html`, an offline browser view with
-  level selection and click-to-drill-down navigation.
+  an interactive C4 relationship graph, level selection and click-to-drill-down
+  navigation. Declared relations are solid green arrows; code-derived evidence
+  is orange and dashed. The graph supports pan and zoom without external assets.
 - `up <node>` maps a code node to its component, container, and system.
 - `down <element> --to code` returns the implementing graph node IDs.
 - `impact <node-or-file>` performs a reverse dependency walk and returns the

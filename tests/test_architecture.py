@@ -162,4 +162,6 @@ def test_architecture_html_cli_writes_interactive_c4_view(monkeypatch, tmp_path,
     html = html_path.read_text(encoding="utf-8")
     assert "C4 Architecture" in html
     assert "front.ui" in html
-    assert "Click a card to drill down" in html
+    assert "Architecture graph" in html
+    assert "Click a node to drill down" in html
+    assert "Observed code evidence" in html
