@@ -255,3 +255,4 @@ def test_architecture_html_cli_writes_interactive_c4_view(monkeypatch, tmp_path,
     assert "cross-package bridges" in html
     assert "go_import_type" in html
     assert "maxFocusedCodeNodes = 750" in html
+    assert "growConnected" in html
