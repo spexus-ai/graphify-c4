@@ -165,6 +165,35 @@ def validate_model(model: object) -> list[str]:
             errors.append(f"rule {index} deny.target must reference an element")
         if target_type is not None and target_type not in C4_TYPES:
             errors.append(f"rule {index} deny.target_type is invalid")
+
+    # A workspace model is still a normal C4 contract.  The optional repository
+    # catalogue only tells the workspace command where its observed graphs live;
+    # it deliberately does not change the projection schema or C4 semantics.
+    repositories = model.get("repositories")
+    if repositories is not None:
+        if not isinstance(repositories, list) or not repositories:
+            errors.append("repositories must be a non-empty list when present")
+        else:
+            repository_ids: set[str] = set()
+            for index, repository in enumerate(repositories):
+                if not isinstance(repository, dict):
+                    errors.append(f"repository {index} must be an object")
+                    continue
+                repository_id = repository.get("id")
+                repository_path = repository.get("path")
+                if not isinstance(repository_id, str) or not repository_id.strip():
+                    errors.append(f"repository {index} has invalid id")
+                elif repository_id in repository_ids:
+                    errors.append(f"duplicate repository id '{repository_id}'")
+                else:
+                    repository_ids.add(repository_id)
+                if not isinstance(repository_path, str) or not repository_path.strip():
+                    errors.append(f"repository {index} needs a non-empty path")
+                elif Path(repository_path).is_absolute():
+                    errors.append(f"repository {index} path must be relative to the workspace")
+                graph_path = repository.get("graph")
+                if graph_path is not None and (not isinstance(graph_path, str) or not graph_path.strip()):
+                    errors.append(f"repository {index} graph must be a non-empty relative path")
     return errors
 
 
@@ -789,6 +818,113 @@ def load_graph(path: Path) -> dict[str, Any]:
     return data
 
 
+def _workspace_graph_path(workspace_root: Path, repository: dict[str, Any]) -> Path:
+    """Resolve one repository graph without permitting a workspace escape."""
+    repository_path = Path(str(repository["path"]))
+    graph_path = Path(str(repository.get("graph", "graphify-out/graph.json")))
+    if graph_path.is_absolute():
+        raise ValueError(f"repository '{repository['id']}' graph must be relative to its path")
+    root = workspace_root.resolve()
+    resolved = (root / repository_path / graph_path).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"repository '{repository['id']}' graph escapes the workspace") from exc
+    return resolved
+
+
+def compose_workspace_graph(model: dict[str, Any], workspace_root: Path) -> dict[str, Any]:
+    """Merge repository facts into one namespaced graph for a C4 projection.
+
+    Node IDs and source paths receive stable repository namespaces.  This avoids
+    collisions between independently extracted projects while preserving the
+    original evidence fields needed by conformance, impact and the Code view.
+    No cross-repository implementation edge is inferred here: integration
+    relationships remain declared contracts until a dedicated extractor proves
+    them.
+    """
+    repositories = model.get("repositories")
+    if not isinstance(repositories, list) or not repositories:
+        raise ValueError("workspace architecture model needs a non-empty repositories list")
+
+    nodes: list[dict[str, Any]] = []
+    links: list[dict[str, Any]] = []
+    repository_summaries: list[dict[str, Any]] = []
+    for repository in repositories:
+        repository_id = str(repository["id"])
+        repository_path = _normalise_path(repository["path"]).rstrip("/")
+        graph_path = _workspace_graph_path(workspace_root, repository)
+        graph = load_graph(graph_path)
+        local_nodes = {
+            str(node.get("id")): node
+            for node in graph.get("nodes", [])
+            if isinstance(node, dict) and isinstance(node.get("id"), str)
+        }
+
+        def namespace_node_id(node_id: object) -> str:
+            return f"{repository_id}::{node_id}"
+
+        def namespace_source_file(value: object) -> str:
+            source_file = _normalise_path(value)
+            return f"{repository_path}/{source_file}" if source_file else repository_path
+
+        for node_id, node in sorted(local_nodes.items()):
+            copied = dict(node)
+            copied["id"] = namespace_node_id(node_id)
+            copied["source_file"] = namespace_source_file(node.get("source_file"))
+            copied["workspace_repository"] = repository_id
+            copied["repository_node_id"] = node_id
+            nodes.append(copied)
+        link_count = 0
+        for link in _links(graph):
+            source = str(link.get("_src") or link.get("source") or "")
+            target = str(link.get("_tgt") or link.get("target") or "")
+            # A raw graph can contain stale endpoints.  Do not create dangling
+            # workspace edges: they would look like evidence across repositories.
+            if source not in local_nodes or target not in local_nodes:
+                continue
+            copied = dict(link)
+            copied.pop("_src", None)
+            copied.pop("_tgt", None)
+            copied["source"] = namespace_node_id(source)
+            copied["target"] = namespace_node_id(target)
+            if copied.get("source_file"):
+                copied["source_file"] = namespace_source_file(copied["source_file"])
+            copied["workspace_repository"] = repository_id
+            links.append(copied)
+            link_count += 1
+        repository_summaries.append({
+            "id": repository_id,
+            "path": repository_path,
+            "graph": str(graph_path),
+            "nodes": len(local_nodes),
+            "links": link_count,
+        })
+    return {
+        "nodes": nodes,
+        "links": links,
+        "workspace_repositories": repository_summaries,
+    }
+
+
+def sync_workspace(
+    model_path: Path,
+    workspace_root: Path,
+    output_path: Path,
+    graph_output_path: Path | None = None,
+) -> dict[str, Any]:
+    """Build and persist a namespaced multi-repository C4 projection."""
+    model = load_model(model_path)
+    graph = compose_workspace_graph(model, workspace_root)
+    if graph_output_path is not None:
+        write_json_atomic(graph_output_path, graph, indent=2, ensure_ascii=False)
+    projection = build_projection(model, graph)
+    projection["workspace_repositories"] = graph["workspace_repositories"]
+    projection["findings"] = conformance(projection)
+    write_json_atomic(output_path, projection, indent=2, ensure_ascii=False)
+    return projection
+
+
 def sync(model_path: Path, graph_path: Path, output_path: Path) -> dict[str, Any]:
     model = load_model(model_path)
     graph = load_graph(graph_path)
@@ -877,6 +1013,7 @@ Commands:
   view       show one C4 level: --level context|container|component|code
   html       write an interactive architecture.html browser view
   diff       compare two synced projections at Context, Container, Component and Code
+  workspace  compose repository graphs declared by a workspace C4 model
   up <node>  raise a code node or C4 id to its C4 ancestors
   down <id>  descend via --to component|container|code
   impact <node-or-file>  reverse-walk dependencies and return C4 components
@@ -884,6 +1021,10 @@ Commands:
 Common options: --model PATH --graph PATH --out PATH
 
 Diff options: --before PROJECTION --after PROJECTION --out PATH [--html PATH]
+
+Workspace options:
+  workspace sync --model MODEL --root WORKSPACE --out PROJECTION [--graph-out GRAPH]
+  workspace html --model MODEL --root WORKSPACE --output HTML [--out PROJECTION] [--graph-out GRAPH]
 """.rstrip()
 
 
@@ -894,6 +1035,65 @@ def dispatch_cli(args: list[str]) -> int:
         return 0
     command = args[0]
     try:
+        if command == "workspace":
+            if len(args) < 2 or args[1] in ("-h", "--help"):
+                print(architecture_usage())
+                return 0
+            workspace_command = args[1]
+            model_path = Path("architecture/spexus.c4.json")
+            workspace_root = Path(".")
+            output_path = Path("architecture/graphify-out/architecture.json")
+            graph_output_path: Path | None = Path("architecture/graphify-out/workspace-graph.json")
+            html_output = Path("architecture/graphify-out/architecture.html")
+            index = 2
+            while index < len(args):
+                option = args[index]
+                if option in ("--model", "--root", "--out", "--graph-out", "--output"):
+                    if index + 1 >= len(args):
+                        raise ValueError(f"{option} needs a path")
+                    value = Path(args[index + 1])
+                    if option == "--model":
+                        model_path = value
+                    elif option == "--root":
+                        workspace_root = value
+                    elif option == "--out":
+                        output_path = value
+                    elif option == "--graph-out":
+                        graph_output_path = value
+                    else:
+                        html_output = value
+                    index += 2
+                elif option.startswith("--model="):
+                    model_path = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--root="):
+                    workspace_root = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--out="):
+                    output_path = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--graph-out="):
+                    graph_output_path = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--output="):
+                    html_output = Path(option.split("=", 1)[1]); index += 1
+                else:
+                    raise ValueError(f"unknown workspace option '{option}'")
+            if workspace_command not in ("sync", "html"):
+                raise ValueError("workspace command must be sync or html")
+            projection = sync_workspace(
+                model_path, workspace_root, output_path,
+                graph_output_path=graph_output_path,
+            )
+            print(
+                f"Workspace architecture projection: {len(projection['elements'])} elements, "
+                f"{len(projection['observed_relations'])} observed relationships, "
+                f"{len(projection['workspace_repositories'])} repositories\n"
+                f"Wrote {output_path}"
+            )
+            if workspace_command == "html":
+                from graphify.architecture_html import write_architecture_html
+
+                write_architecture_html(projection, html_output)
+                print(f"Wrote interactive workspace architecture view: {html_output}")
+            return 0
+
         if command == "diff":
             before_path: Path | None = None
             after_path: Path | None = None

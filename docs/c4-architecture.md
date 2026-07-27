@@ -61,6 +61,39 @@ dependencies, for example a frontend container reaching any datastore:
 }
 ```
 
+## Multi-repository workspace
+
+A workspace model is the same C4 contract with an additional `repositories`
+catalogue. Each entry has a stable `id`, a path relative to the workspace root,
+and optionally a non-default graph path.
+
+```json
+{
+  "schema": "graphify.architecture/v1",
+  "repositories": [
+    {"id": "front", "path": "front"},
+    {"id": "back", "path": "back", "graph": "architecture/graphify-out/graph.json"}
+  ],
+  "scope": {"include": ["front/src/**", "back/internal/**"]}
+}
+```
+
+```text
+graphify architecture workspace html \
+  --model architecture/spexus.c4.json \
+  --root . \
+  --out architecture/graphify-out/architecture.json \
+  --graph-out architecture/graphify-out/workspace-graph.json \
+  --output architecture/graphify-out/architecture.html
+```
+
+The workspace command namespaces node IDs and source paths (`front::…`,
+`front/src/…`) before C4 projection. This prevents independently extracted
+repositories from merging same-named symbols. It does not infer a
+cross-repository implementation edge: declare HTTP, message, CLI, or datastore
+boundaries as contracts until an extractor gives direct evidence. The generated
+explorer keeps Context, Container, Component, and Code navigation.
+
 ## Navigation and evidence
 
 - `view` rolls observed symbol relationships to `context`, `container`,

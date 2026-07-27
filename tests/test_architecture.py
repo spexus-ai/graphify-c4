@@ -6,10 +6,13 @@ import graphify.__main__ as mainmod
 from graphify.architecture import (
     architecture_diff,
     build_projection,
+    compose_workspace_graph,
     conformance,
     down,
     impact,
+    load_model,
     suspect_dependencies,
+    sync_workspace,
     up,
     validate_model,
     view,
@@ -318,3 +321,91 @@ def test_architecture_diff_cli_writes_all_levels_and_interactive_view(monkeypatc
     assert "double-click a node to drill down" in html
     assert "#0072B2" in html
     assert "triangleDown" in html
+
+
+def test_workspace_composition_namespaces_facts_and_keeps_contracts_declared(tmp_path):
+    model = {
+        "schema": "graphify.architecture/v1",
+        "repositories": [
+            {"id": "web", "path": "web"},
+            {"id": "api", "path": "api"},
+        ],
+        "scope": {"include": ["web/src/**", "api/src/**"]},
+        "elements": [
+            {"id": "system", "c4_type": "software_system", "name": "System"},
+            {"id": "web.container", "c4_type": "container", "parent": "system", "name": "Web"},
+            {"id": "api.container", "c4_type": "container", "parent": "system", "name": "API"},
+            {"id": "web.ui", "c4_type": "component", "parent": "web.container", "name": "UI",
+             "implementation": [{"path_prefix": "web/src"}]},
+            {"id": "api.handlers", "c4_type": "component", "parent": "api.container", "name": "Handlers",
+             "implementation": [{"path_prefix": "api/src"}]},
+        ],
+        "relations": [{"source": "web.container", "target": "api.container", "kind": "http"}],
+        "rules": [],
+    }
+    raw_graph = {
+        "nodes": [{"id": "main", "label": "main", "file_type": "code", "source_file": "src/main.ts"}],
+        "links": [{"source": "main", "target": "main", "relation": "contains", "source_file": "src/main.ts"}],
+    }
+    for repository in ("web", "api"):
+        output = tmp_path / repository / "graphify-out"
+        output.mkdir(parents=True)
+        (output / "graph.json").write_text(json.dumps(raw_graph), encoding="utf-8")
+    model_path = tmp_path / "model.json"
+    model_path.write_text(json.dumps(model), encoding="utf-8")
+
+    composed = compose_workspace_graph(load_model(model_path), tmp_path)
+    projection_path = tmp_path / "architecture.json"
+    graph_path = tmp_path / "workspace-graph.json"
+    projection = sync_workspace(model_path, tmp_path, projection_path, graph_path)
+
+    assert {item["id"] for item in composed["nodes"]} == {"web::main", "api::main"}
+    assert {item["source_file"] for item in composed["nodes"]} == {"web/src/main.ts", "api/src/main.ts"}
+    assert {item["id"] for item in projection["elements"] if item["c4_type"] == "code"} == {
+        "code:web::main", "code:api::main",
+    }
+    assert projection["workspace_repositories"] == [
+        {"id": "web", "path": "web", "graph": str(tmp_path / "web/graphify-out/graph.json"), "nodes": 1, "links": 1},
+        {"id": "api", "path": "api", "graph": str(tmp_path / "api/graphify-out/graph.json"), "nodes": 1, "links": 1},
+    ]
+    assert projection["declared_relations"] == model["relations"]
+    assert projection_path.exists() and graph_path.exists()
+
+
+def test_workspace_html_cli_writes_all_level_explorer(monkeypatch, tmp_path, capsys):
+    model = {
+        "schema": "graphify.architecture/v1",
+        "repositories": [{"id": "web", "path": "web"}],
+        "scope": {"include": ["web/src/**"]},
+        "elements": [
+            {"id": "system", "c4_type": "software_system", "name": "System"},
+            {"id": "web.container", "c4_type": "container", "parent": "system", "name": "Web"},
+            {"id": "web.ui", "c4_type": "component", "parent": "web.container", "name": "UI",
+             "implementation": [{"path_prefix": "web/src"}]},
+        ],
+        "relations": [], "rules": [],
+    }
+    model_path = tmp_path / "model.json"
+    model_path.write_text(json.dumps(model), encoding="utf-8")
+    graph_dir = tmp_path / "web/graphify-out"
+    graph_dir.mkdir(parents=True)
+    (graph_dir / "graph.json").write_text(json.dumps({
+        "nodes": [{"id": "ui", "label": "render", "file_type": "code", "source_file": "src/render.ts"}],
+        "links": [],
+    }), encoding="utf-8")
+    projection_path = tmp_path / "architecture.json"
+    workspace_graph_path = tmp_path / "workspace-graph.json"
+    html_path = tmp_path / "architecture.html"
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv", [
+        "graphify", "architecture", "workspace", "html", "--model", str(model_path), "--root", str(tmp_path),
+        "--out", str(projection_path), "--graph-out", str(workspace_graph_path), "--output", str(html_path),
+    ])
+
+    mainmod.main()
+
+    assert "Workspace architecture projection" in capsys.readouterr().out
+    assert html_path.exists()
+    html = html_path.read_text(encoding="utf-8")
+    assert "Graphify C4 Architecture" in html
+    assert "web::ui" in html
