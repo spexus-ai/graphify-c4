@@ -1895,6 +1895,12 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
         stub_id = str(stub.get("id", ""))
         if not stub_id:
             continue
+        # Go (and future language-aware extractors) can mark a type reference
+        # as namespace-qualified.  A generic label match cannot prove such a
+        # reference points at a project definition, so preserve the external
+        # stub instead of fabricating a cross-component edge.
+        if stub.get("_qualified_ref"):
+            continue
         candidates = real_by_label.get(_node_label_key(stub), [])
         if len(candidates) != 1:
             # No unique exact type match — fall back to a case-insensitive match, but
@@ -4260,7 +4266,7 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     ProcessPoolExecutor.
 
     Args:
-        args: (index, path_str, root_str, cache_location_str) tuple. ``root``
+        args: (index, path_str, root_str, cache_location_str, force) tuple. ``root``
             anchors hash keys / node ids / the XAML boundary; ``cache_location``
             is where the cache dir is written, decoupled per #1774. A legacy
             3-tuple (no cache_location) is still accepted for back-compat.
@@ -4268,7 +4274,10 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     Returns:
         (index, result_dict) so results can be placed back in order.
     """
-    if len(args) == 4:
+    force = False
+    if len(args) == 5:
+        idx, path_str, root_str, cache_location_str, force = args
+    elif len(args) == 4:
         idx, path_str, root_str, cache_location_str = args
     else:  # legacy 3-tuple: location == anchor
         idx, path_str, root_str = args
@@ -4280,7 +4289,7 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
 
     # Check cache first (avoid re-extraction)
-    if not bypass_cache:
+    if not force and not bypass_cache:
         cached = load_cached(path, root, cache_root=cache_location)
         if cached is not None:
             return idx, cached
@@ -4307,6 +4316,7 @@ def _extract_parallel(
     max_workers: int | None,
     total_files: int,
     cache_location: Path | None = None,
+    force: bool = False,
 ) -> bool:
     """Extract uncached files in parallel using ProcessPoolExecutor.
 
@@ -4356,7 +4366,7 @@ def _extract_parallel(
     # the cache dir is written (defaults to root when not decoupled) (#1774).
     root_str = str(root)
     cache_loc_str = str(cache_location if cache_location is not None else root)
-    work_items = [(idx, str(path), root_str, cache_loc_str) for idx, path in uncached_work]
+    work_items = [(idx, str(path), root_str, cache_loc_str, force) for idx, path in uncached_work]
 
     done_count = 0
     _PROGRESS_INTERVAL = 100
@@ -4459,6 +4469,7 @@ def extract(
     root: Path | None = None,
     parallel: bool = True,
     max_workers: int | None = None,
+    force: bool = False,
 ) -> dict:
     """Extract AST nodes and edges from a list of code files.
 
@@ -4481,6 +4492,7 @@ def extract(
             use ProcessPoolExecutor for multi-core extraction.
         max_workers: max subprocess count. Defaults to cpu_count (or the
             value of GRAPHIFY_MAX_WORKERS if set), bounded by len(uncached_work).
+        force: re-extract every source file instead of serving AST cache entries.
     """
     paths = [Path(p) for p in paths]
     anchor_root = Path(root) if root is not None else None
@@ -4535,7 +4547,7 @@ def extract(
             per_file[i] = {"nodes": [], "edges": []}
             continue
         bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
-        if not bypass_cache:
+        if not force and not bypass_cache:
             cached = load_cached(path, root, cache_root=cache_location)
             if cached is not None:
                 per_file[i] = cached
@@ -4546,9 +4558,14 @@ def extract(
     if uncached_work:
         ran_parallel = False
         if parallel and len(uncached_work) >= _PARALLEL_THRESHOLD:
-            ran_parallel = _extract_parallel(
-                uncached_work, per_file, root, max_workers, total, cache_location
-            )
+            if force:
+                ran_parallel = _extract_parallel(
+                    uncached_work, per_file, root, max_workers, total, cache_location, force=True
+                )
+            else:
+                ran_parallel = _extract_parallel(
+                    uncached_work, per_file, root, max_workers, total, cache_location
+                )
         if not ran_parallel:
             _extract_sequential(uncached_work, per_file, root, total, cache_location)
 
@@ -4633,10 +4650,23 @@ def extract(
     all_nodes: list[dict] = []
     all_edges: list[dict] = []
     all_raw_calls: list[dict] = []
-    for result in per_file:
+    # Extractors retain a convenient basename in ``source_file``.  Keep the
+    # project-relative directory separately while aggregating: Go package
+    # imports are directory-addressed and two ``service.go`` files can coexist.
+    nid_to_project_dir: dict[str, str] = {}
+    for result, source_path in zip(per_file, paths):
         all_nodes.extend(result.get("nodes", []))
         all_edges.extend(result.get("edges", []))
         all_raw_calls.extend(result.get("raw_calls", []))
+        try:
+            relative_dir = source_path.resolve().relative_to(root.resolve()).parent.as_posix()
+        except (OSError, RuntimeError, ValueError):
+            relative_dir = source_path.parent.as_posix()
+        relative_dir = relative_dir.strip(".")
+        for node in result.get("nodes", []):
+            nid = node.get("id")
+            if nid:
+                nid_to_project_dir[str(nid)] = relative_dir
     # Function / method / class def ids for the cross-file indirect_call callable
     # guard. Built from the `_callable` node marker AFTER the id-remap / disambiguation
     # passes below (which rewrite node ids), so it can never go stale — see the
@@ -4821,6 +4851,10 @@ def extract(
                 cn = rc.get("caller_nid")
                 if cn in sym_remap:
                     rc["caller_nid"] = sym_remap[cn]
+            for old_nid, new_nid in sym_remap.items():
+                project_dir = nid_to_project_dir.pop(old_nid, None)
+                if project_dir is not None:
+                    nid_to_project_dir[new_nid] = project_dir
         if edge_alias_candidates:
             def _edge_key(edge: dict) -> str:
                 # target_file is a transient stamp (#1814/#1983); exclude it
@@ -5085,6 +5119,15 @@ def extract(
     # function/method/class, never a same-named data symbol, and the guard never goes
     # stale when node ids were relativized/disambiguated above (#1566).
     callable_nids = {n["id"] for n in all_nodes if n.get("_callable")}
+    # The Go extractor represents functions/methods through their ``()`` label
+    # but predates the generic ``_callable`` marker.  Keep its local-import
+    # resolver strict nevertheless: types and fields must never satisfy a
+    # package-qualified function call merely because their names coincide.
+    go_callable_nids = {
+        n["id"] for n in all_nodes
+        if str(n.get("source_file", "")).endswith(".go")
+        and str(n.get("label", "")).endswith("()")
+    }
     # Class defs are callable only via their constructor; they are frequently passed
     # as descriptive values (`select(Model)`, exception tuples), not invoked. Exclude
     # them from the indirect_call guard below to avoid false edges (#2137).
@@ -5153,6 +5196,42 @@ def extract(
     # file is real ONLY if the caller imported it. So a cross-file call from one
     # of these files with no import evidence is gated below (#1659).
     _JS_TS_CALL_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+
+    # Go selectors carry package namespace information that bare-name resolution
+    # must never discard.  ``context.WithTimeout`` is not a call to any local
+    # ``WithTimeout`` method.  Resolve only calls into this module, scoped by the
+    # exact imported package directory; external and stdlib calls intentionally
+    # remain outside the project graph.
+    go_module_path = ""
+    try:
+        for line in (root / "go.mod").read_text(encoding="utf-8").splitlines():
+            if line.startswith("module "):
+                go_module_path = line.split(None, 1)[1].strip()
+                break
+    except OSError:
+        pass
+
+    def _go_source_dir(source_file: object) -> str:
+        try:
+            path = Path(str(source_file))
+            relative = path.relative_to(root) if path.is_absolute() else path
+            return relative.parent.as_posix().strip(".")
+        except ValueError:
+            return ""
+
+    def _resolve_go_import_call(raw_call: dict[str, Any]) -> str | None:
+        import_path = str(raw_call.get("import_path", ""))
+        if not go_module_path or not import_path.startswith(go_module_path + "/"):
+            return None
+        package_dir = import_path[len(go_module_path) + 1:].rstrip("/")
+        candidates = [
+            candidate for candidate in global_label_to_nids.get(str(raw_call.get("callee", "")), [])
+            if candidate in go_callable_nids
+            and (nid_to_project_dir.get(candidate) or _go_source_dir(nid_to_source_file.get(candidate, "")))
+            == package_dir
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
     for rc in all_raw_calls:
         callee = rc.get("callee", "")
         if not callee:
@@ -5176,6 +5255,27 @@ def extract(
         # to external commands that merely share a name with a function elsewhere
         # in the corpus — exactly what #2141 must not do.
         if rc.get("language") == "bash":
+            continue
+        if rc.get("language") == "go" and rc.get("package_qualified"):
+            target = _resolve_go_import_call(rc)
+            caller = rc["caller_nid"]
+            if target is not None and target != caller and (caller, target) not in existing_pairs:
+                existing_pairs.add((caller, target))
+                all_edges.append({
+                    "source": caller,
+                    "target": target,
+                    "relation": "calls",
+                    "context": "call",
+                    "confidence": "EXTRACTED",
+                    "confidence_score": 1.0,
+                    "resolution": "go_import",
+                    "import_path": rc.get("import_path", ""),
+                    "source_file": rc.get("source_file", ""),
+                    "source_location": rc.get("source_location"),
+                    "weight": 1.0,
+                })
+            # A package-qualified Go call has been resolved precisely or is
+            # external.  It must never fall through to a corpus-wide name match.
             continue
         # Exact-case match first (case is semantic). Fold only when the CALLING
         # file's language is case-insensitive, and only against the folded index of
@@ -5303,11 +5403,24 @@ def extract(
         if not has_import_evidence and str(rc.get("source_file", "")).endswith(_JS_TS_CALL_SUFFIXES):
             continue
         if tgt != caller and (caller, tgt) not in existing_pairs:
+            resolution = "name_guess"
+            if rc.get("language") == "go":
+                # Bare calls are valid only inside the same Go package. Cross-
+                # directory Go calls require an import qualifier and were handled
+                # above; accepting them here recreates name-collision edges.
+                if _go_source_dir(rc.get("source_file", "")) != _go_source_dir(
+                    nid_to_source_file.get(tgt, "")
+                ):
+                    continue
+                resolution = "same_go_package"
             existing_pairs.add((caller, tgt))
             # Promote to EXTRACTED when there's a direct import edge from the
             # caller's file pointing at either the callee symbol itself or the
             # file the callee lives in.
-            if has_import_evidence:
+            if rc.get("language") == "go":
+                confidence = "EXTRACTED"
+                confidence_score = 1.0
+            elif has_import_evidence:
                 confidence = "EXTRACTED"
                 confidence_score = 1.0
             else:
@@ -5320,6 +5433,7 @@ def extract(
                 "context": "call",
                 "confidence": confidence,
                 "confidence_score": confidence_score,
+                "resolution": resolution,
                 "source_file": rc.get("source_file", ""),
                 "source_location": rc.get("source_location"),
                 "weight": 1.0,
@@ -5407,6 +5521,7 @@ def extract(
     # cache keeps its own copy, which is what the colliding-id pass reads on a cache hit.
     for n in all_nodes:
         n.pop("origin_file", None)
+        n.pop("_qualified_ref", None)  # extractor-only namespace safety marker
         n.pop("_callable", None)  # internal indirect_call marker — never ships to graph.json
         n.pop("_callable_class", None)  # internal #2137 marker — never ships to graph.json
 

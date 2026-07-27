@@ -12,6 +12,7 @@ the generic graph.
 graphify architecture init
 graphify architecture sync
 graphify architecture validate
+graphify architecture audit --suspect
 graphify architecture view --level container
 graphify architecture html
 ```
@@ -76,7 +77,12 @@ dependencies, for example a frontend container reaching any datastore:
   impacted components.
 - `validate` reports unmapped code, ambiguous mappings, observed dependencies
   missing from `relations`, and rule violations.
+- `audit --suspect` lists cross-component dependencies that are based on a
+  name-only or unknown resolution rather than a same-file/same-package match or
+  an explicit local Go import. Treat these as leads for review, not as confirmed
+  architecture violations.
 
 Every observed relationship in `architecture.json` retains the code node IDs,
-source file, source location, and `EXTRACTED`/`INFERRED` confidence. Only
-reviewed rules backed by `EXTRACTED` evidence should fail CI.
+source file, source location, resolution provenance, and
+`EXTRACTED`/`INFERRED` confidence. Only reviewed rules backed by `EXTRACTED`
+evidence with trustworthy resolution should fail CI.

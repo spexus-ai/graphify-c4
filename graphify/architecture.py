@@ -35,6 +35,7 @@ LEVEL_TYPES = {
     "component": {"component"},
     "code": {"code"},
 }
+TRUSTED_RESOLUTIONS = frozenset({"same_file", "same_go_package", "go_import"})
 
 
 def default_model() -> dict[str, Any]:
@@ -298,6 +299,7 @@ def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, 
             "source_file": link.get("source_file", ""),
             "source_location": link.get("source_location", ""),
             "confidence": link.get("confidence", "EXTRACTED"),
+            "resolution": link.get("resolution", "unknown"),
         }
         if source in code_node_ids and target in code_node_ids:
             code_key = (code_node_ids[source], code_node_ids[target], relation)
@@ -418,6 +420,66 @@ def conformance(projection: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
     return findings
+
+
+def suspect_dependencies(projection: dict[str, Any], graph: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return cross-component facts that lack a namespace/import proof.
+
+    The result is deliberately an audit queue, not an architecture violation:
+    older graphs and language extractors may not yet emit resolution provenance.
+    """
+    mappings = projection.get("mappings", {})
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for link in _links(graph):
+        source_node = str(link.get("_src") or link.get("source") or "")
+        target_node = str(link.get("_tgt") or link.get("target") or "")
+        source_mapping = mappings.get(source_node, [])
+        target_mapping = mappings.get(target_node, [])
+        if len(source_mapping) != 1 or len(target_mapping) != 1:
+            continue
+        source, target = source_mapping[0], target_mapping[0]
+        if source == target:
+            continue
+        confidence = str(link.get("confidence", "EXTRACTED"))
+        resolution = str(link.get("resolution", "unknown"))
+        if confidence == "EXTRACTED" and resolution in TRUSTED_RESOLUTIONS:
+            continue
+        finding = grouped.setdefault(
+            (source, target),
+            {
+                "severity": "warning",
+                "kind": "suspect_dependency",
+                "source": source,
+                "target": target,
+                "evidence_count": 0,
+                "reasons": set(),
+                "samples": [],
+            },
+        )
+        finding["evidence_count"] += 1
+        finding["reasons"].add(
+            (str(link.get("relation") or "uses"), confidence, resolution)
+        )
+        if len(finding["samples"]) < 3:
+            finding["samples"].append(
+                {
+                    "source_node": source_node,
+                    "target_node": target_node,
+                    "source_file": link.get("source_file", ""),
+                    "source_location": link.get("source_location", ""),
+                }
+            )
+    findings = []
+    for finding in grouped.values():
+        finding["reasons"] = [
+            {"relation": relation, "confidence": confidence, "resolution": resolution}
+            for relation, confidence, resolution in sorted(finding["reasons"])
+        ]
+        findings.append(finding)
+    return sorted(
+        findings,
+        key=lambda item: (item["source"], item["target"]),
+    )
 
 
 def _element_index(projection: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -646,6 +708,7 @@ Commands:
   init       create architecture/graphify.c4.json without overwriting it
   sync       project graph.json onto the declared C4 model
   validate   report model/conformance violations (exit 2 on errors)
+  audit      list cross-component edges without namespace/import proof
   view       show one C4 level: --level context|container|component|code
   html       write an interactive architecture.html browser view
   up <node>  raise a code node or C4 id to its C4 ancestors
@@ -693,6 +756,29 @@ def dispatch_cli(args: list[str]) -> int:
                 raise ValueError("validate accepts only common path options")
             print(format_findings(projection["findings"]))
             return 2 if any(item["severity"] == "error" for item in projection["findings"]) else 0
+
+        if command == "audit":
+            if rest and rest != ["--suspect"]:
+                raise ValueError("audit accepts only --suspect")
+            findings = suspect_dependencies(projection, graph)
+            if not findings:
+                print("Architecture audit: no suspect dependencies")
+                return 0
+            print("Architecture audit: suspect dependencies")
+            for finding in findings:
+                reasons = ", ".join(
+                    f"{item['relation']}; {item['confidence']}; {item['resolution']}"
+                    for item in finding["reasons"]
+                )
+                samples = ", ".join(
+                    f"{item['source_file']}:{item['source_location']}"
+                    for item in finding["samples"]
+                )
+                print(
+                    f"- {finding['source']} -> {finding['target']} "
+                    f"[{finding['evidence_count']} evidence; {reasons}] {samples}"
+                )
+            return 0
 
         if command == "html":
             output = Path("graphify-out/architecture.html")

@@ -8,6 +8,7 @@ from graphify.architecture import (
     conformance,
     down,
     impact,
+    suspect_dependencies,
     up,
     validate_model,
     view,
@@ -43,6 +44,7 @@ GRAPH = {
         {
             "source": "ui", "target": "db", "relation": "calls", "confidence": "EXTRACTED",
             "source_file": "src/ui/render.ts", "source_location": "L14",
+            "resolution": "go_import",
         },
     ],
 }
@@ -88,6 +90,7 @@ def test_projection_rolls_code_relationships_to_c4_and_retains_evidence():
             "evidence": [{
                 "source_node": "ui", "target_node": "db", "source_file": "src/ui/render.ts",
                 "source_location": "L14", "confidence": "EXTRACTED",
+                "resolution": "go_import",
             }],
         }
     ]
@@ -100,6 +103,7 @@ def test_projection_rolls_code_relationships_to_c4_and_retains_evidence():
             "evidence": [{
                 "source_node": "ui", "target_node": "db", "source_file": "src/ui/render.ts",
                 "source_location": "L14", "confidence": "EXTRACTED",
+                "resolution": "go_import",
             }],
         }
     ]
@@ -112,6 +116,28 @@ def test_conformance_reports_forbidden_undeclared_and_unmapped_code():
         "forbidden_dependency", "undeclared_dependency", "unmapped_code",
     }
     assert next(finding for finding in findings if finding["kind"] == "forbidden_dependency")["rule"] == "front-no-db"
+
+
+def test_suspect_dependencies_require_namespace_or_import_proof():
+    graph = {
+        **GRAPH,
+        "links": [{
+            **GRAPH["links"][0],
+            "confidence": "INFERRED",
+            "resolution": "name_guess",
+        }],
+    }
+
+    findings = suspect_dependencies(build_projection(MODEL, graph), graph)
+
+    assert findings == [{
+        "severity": "warning", "kind": "suspect_dependency", "source": "front.ui", "target": "database",
+        "evidence_count": 1,
+        "reasons": [{"relation": "calls", "confidence": "INFERRED", "resolution": "name_guess"}],
+        "samples": [{
+            "source_node": "ui", "target_node": "db", "source_file": "src/ui/render.ts", "source_location": "L14",
+        }],
+    }]
 
 
 def test_projection_keeps_intra_component_code_relationships():
@@ -131,7 +157,7 @@ def test_projection_keeps_intra_component_code_relationships():
         "confidence": {"EXTRACTED": 1},
         "evidence": [{
             "source_node": "ui", "target_node": "helper", "source_file": "",
-            "source_location": "", "confidence": "EXTRACTED",
+            "source_location": "", "confidence": "EXTRACTED", "resolution": "unknown",
         }],
     }]
 

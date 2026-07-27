@@ -252,11 +252,64 @@ def test_go_imported_type_stubs_do_not_collide_across_source_files(tmp_path):
     second.write_text('package b\n\nimport "ext"\n\nfunc UseB(w ext.Widget) {}\n', encoding="utf-8")
 
     result = extract([first, second], cache_root=tmp_path)
-    widget_nodes = [node for node in result["nodes"] if node["label"] == "Widget"]
+    widget_nodes = [node for node in result["nodes"] if node["label"] == "ext.Widget"]
 
     assert len(widget_nodes) == 2
     assert len({node["id"] for node in widget_nodes}) == 2
     assert all(not node.get("source_file") for node in widget_nodes)
+
+
+def test_go_qualified_stdlib_symbols_never_bind_to_project_symbols(tmp_path):
+    """A stdlib qualifier must not become a same-named local type/method edge."""
+    (tmp_path / "go.mod").write_text("module example.test/app\n\ngo 1.22\n", encoding="utf-8")
+    bench = tmp_path / "bench"
+    obs = tmp_path / "obs"
+    bench.mkdir()
+    obs.mkdir()
+    (bench / "bench.go").write_text(
+        'package bench\n\nimport "net/http"\n\ntype BenchmarkClient struct { Client *http.Client }\n',
+        encoding="utf-8",
+    )
+    (obs / "obs.go").write_text(
+        'package obs\n\nimport "context"\n\ntype Client struct{}\n'
+        'type TimeoutManager struct{}\nfunc (TimeoutManager) WithTimeout() {}\n'
+        'func Check() { _, cancel := context.WithTimeout(context.Background(), 1); defer cancel() }\n',
+        encoding="utf-8",
+    )
+
+    result = extract([bench / "bench.go", obs / "obs.go"], cache_root=tmp_path, root=tmp_path)
+    nodes = {node["id"]: node for node in result["nodes"]}
+    benchmark_client = next(node_id for node_id, node in nodes.items() if node["label"] == "BenchmarkClient")
+    client = next(node_id for node_id, node in nodes.items() if node["label"] == "Client")
+    check = next(node_id for node_id, node in nodes.items() if node["label"] == "Check()")
+    timeout = next(node_id for node_id, node in nodes.items() if node["label"] == ".WithTimeout()")
+    pairs = {(edge["source"], edge["target"]) for edge in result["edges"]}
+
+    assert (benchmark_client, client) not in pairs
+    assert (check, timeout) not in pairs
+
+
+def test_go_qualified_local_import_has_go_import_provenance(tmp_path):
+    (tmp_path / "go.mod").write_text("module example.test/app\n\ngo 1.22\n", encoding="utf-8")
+    cmd = tmp_path / "cmd"
+    service = tmp_path / "internal/service"
+    cmd.mkdir(parents=True)
+    service.mkdir(parents=True)
+    (service / "service.go").write_text("package service\n\nfunc Init() {}\n", encoding="utf-8")
+    (cmd / "main.go").write_text(
+        'package main\n\nimport "example.test/app/internal/service"\n\nfunc main() { service.Init() }\n',
+        encoding="utf-8",
+    )
+
+    result = extract([cmd / "main.go", service / "service.go"], cache_root=tmp_path, root=tmp_path)
+    nodes = {node["id"]: node for node in result["nodes"]}
+    main = next(node_id for node_id, node in nodes.items() if node["label"] == "main()")
+    init = next(node_id for node_id, node in nodes.items() if node["label"] == "Init()")
+    edge = next(edge for edge in result["edges"] if edge["source"] == main and edge["target"] == init)
+
+    assert edge["confidence"] == "EXTRACTED"
+    assert edge["resolution"] == "go_import"
+    assert edge["import_path"] == "example.test/app/internal/service"
 
 
 def test_extract_updates_raw_call_callers_after_duplicate_id_disambiguation(tmp_path):
@@ -1299,6 +1352,31 @@ def test_python_aliased_call_survives_warm_cache(tmp_path):
     assert len(_alias_edges(cold)) == 1, "cold run must resolve the aliased call"
     warm = extract(paths, cache_root=tmp_path, root=tmp_path)  # cache-hit
     assert len(_alias_edges(warm)) == 1, "aliased call edge vanished on warm cache (#2082)"
+
+
+def test_extract_force_bypasses_ast_cache(tmp_path, monkeypatch):
+    """A force rebuild must apply extractor fixes to otherwise unchanged code."""
+    from graphify import extract as extract_mod
+
+    source = tmp_path / "worker.py"
+    source.write_text("def work():\n    return 1\n", encoding="utf-8")
+    extract_mod.extract([source], cache_root=tmp_path, root=tmp_path, parallel=False)
+
+    calls = 0
+    real_safe_extract = extract_mod._safe_extract
+
+    def counted_safe_extract(extractor, path):
+        nonlocal calls
+        calls += 1
+        return real_safe_extract(extractor, path)
+
+    monkeypatch.setattr(extract_mod, "_safe_extract", counted_safe_extract)
+    result = extract_mod.extract(
+        [source], cache_root=tmp_path, root=tmp_path, parallel=False, force=True
+    )
+
+    assert calls == 1
+    assert result["nodes"]
 
 
 def test_python_qualified_call_resolves_when_method_name_collides_with_caller(tmp_path):

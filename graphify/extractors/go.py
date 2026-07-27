@@ -23,7 +23,10 @@ def _go_collect_type_refs(node, source: bytes, generic: bool, out: list[tuple[st
             out.append((text, "generic_arg" if generic else "type"))
         return
     if t == "qualified_type":
-        text = _read_text(node, source).rsplit(".", 1)[-1]
+        # Keep the package qualifier.  Reducing ``http.Client`` to ``Client``
+        # lets the corpus-level stub rewire bind it to any project-local Client
+        # declaration (for example a Sentry client), which fabricates a dependency.
+        text = _read_text(node, source)
         if text and text not in _GO_PREDECLARED_TYPES:
             out.append((text, "generic_arg" if generic else "type"))
         return
@@ -76,7 +79,7 @@ def extract_go(path: Path) -> dict:
     edges: list[dict] = []
     seen_ids: set[str] = set()
     function_bodies: list[tuple[str, object]] = []
-    go_imported_pkgs: set[str] = set()  # local names of imported packages
+    go_imported_pkgs: dict[str, str] = {}  # local package name/alias -> import path
 
     def add_node(nid: str, label: str, line: int) -> None:
         if nid not in seen_ids:
@@ -91,7 +94,7 @@ def extract_go(path: Path) -> dict:
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0,
-                 context: str | None = None) -> None:
+                 context: str | None = None, resolution: str = "same_file") -> None:
         edge = {
             "source": src,
             "target": tgt,
@@ -100,6 +103,7 @@ def extract_go(path: Path) -> dict:
             "source_file": str_path,
             "source_location": f"L{line}",
             "weight": weight,
+            "resolution": resolution,
         }
         if context:
             edge["context"] = context
@@ -129,6 +133,11 @@ def extract_go(path: Path) -> dict:
                 "source_file": "",
                 "source_location": "",
                 "origin_file": str_path,
+                # A package-qualified type (http.Client) is external unless a
+                # language-aware resolver proves otherwise.  The generic
+                # sourceless-stub rewire is intentionally name-based and must
+                # never turn it into a project-local Client declaration.
+                "_qualified_ref": "." in name,
             })
         return nid
 
@@ -309,7 +318,7 @@ def extract_go(path: Path) -> dict:
                                 alias = spec.child_by_field_name("name")
                                 local_name = _read_text(alias, source) if alias else raw.split("/")[-1]
                                 if local_name and local_name != "_" and local_name != ".":
-                                    go_imported_pkgs.add(local_name)
+                                    go_imported_pkgs[local_name] = raw
                 elif child.type == "import_spec":
                     path_node = child.child_by_field_name("path")
                     if path_node:
@@ -319,7 +328,7 @@ def extract_go(path: Path) -> dict:
                         alias = child.child_by_field_name("name")
                         local_name = _read_text(alias, source) if alias else raw.split("/")[-1]
                         if local_name and local_name != "_" and local_name != ".":
-                            go_imported_pkgs.add(local_name)
+                            go_imported_pkgs[local_name] = raw
             return
 
         for child in node.children:
@@ -343,6 +352,7 @@ def extract_go(path: Path) -> dict:
             func_node = node.child_by_field_name("function")
             callee_name: str | None = None
             is_member_call: bool = False
+            receiver_name = ""
             if func_node:
                 if func_node.type == "identifier":
                     callee_name = _read_text(func_node, source)
@@ -356,6 +366,26 @@ def extract_go(path: Path) -> dict:
                     if field:
                         callee_name = _read_text(field, source)
             if callee_name and callee_name not in _LANGUAGE_BUILTIN_GLOBALS:
+                # A qualified selector is governed by its import, not by a
+                # same-named declaration somewhere else in the repository.
+                # Leave it for the global resolver, which can prove a local
+                # import path or deliberately leave stdlib/external calls
+                # unresolved.
+                if receiver_name in go_imported_pkgs:
+                    raw_calls.append({
+                        "caller_nid": caller_nid,
+                        "callee": callee_name,
+                        "is_member_call": False,
+                        "language": "go",
+                        "package_qualified": True,
+                        "qualifier": receiver_name,
+                        "import_path": go_imported_pkgs[receiver_name],
+                        "source_file": str_path,
+                        "source_location": f"L{node.start_point[0] + 1}",
+                    })
+                    for child in node.children:
+                        walk_calls(child, caller_nid)
+                    return
                 tgt_nid = label_to_nid.get(callee_name)
                 if tgt_nid and tgt_nid != caller_nid:
                     pair = (caller_nid, tgt_nid)
@@ -371,12 +401,17 @@ def extract_go(path: Path) -> dict:
                             "source_file": str_path,
                             "source_location": f"L{line}",
                             "weight": 1.0,
+                            "resolution": "same_file",
                         })
                 elif callee_name:
                     raw_calls.append({
                         "caller_nid": caller_nid,
                         "callee": callee_name,
                         "is_member_call": is_member_call,
+                        "language": "go",
+                        "package_qualified": receiver_name in go_imported_pkgs,
+                        "qualifier": receiver_name if receiver_name in go_imported_pkgs else "",
+                        "import_path": go_imported_pkgs.get(receiver_name, ""),
                         "source_file": str_path,
                         "source_location": f"L{node.start_point[0] + 1}",
                     })
