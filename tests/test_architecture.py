@@ -251,3 +251,7 @@ def test_architecture_html_cli_writes_interactive_c4_view(monkeypatch, tmp_path,
     assert "observed_code_relations" in html
     assert "select-all-cb" in html
     assert "node-filter" in html
+    assert "packagePath" in html
+    assert "cross-package bridges" in html
+    assert "go_import_type" in html
+    assert "maxFocusedCodeNodes = 750" in html
