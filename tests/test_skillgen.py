@@ -49,6 +49,24 @@ def test_render_is_idempotent():
     assert [(a.path, a.content) for a in first] == [(a.path, a.content) for a in second]
 
 
+def test_every_bundled_skill_includes_portable_workspace_c4_guidance():
+    """Every install target must teach the same multi-repository C4 workflow."""
+    platforms = gen.load_platforms()
+    skills = [
+        artifact
+        for artifact in gen.render_all(platforms)
+        if Path(artifact.path).parent == Path("graphify")
+        and Path(artifact.path).name.startswith("skill")
+        and artifact.path.endswith(".md")
+    ]
+
+    assert skills
+    for skill in skills:
+        assert "architecture workspace init --repo" in skill.content, skill.path
+        assert "architecture workspace html --model architecture/graphify.workspace.c4.json" in skill.content, skill.path
+        assert "Cross-repository HTTP" in skill.content or "cross-repository HTTP" in skill.content, skill.path
+
+
 def test_render_output_is_lf_only():
     """Generated artifacts use LF newlines and end in exactly one newline."""
     platforms = gen.load_platforms()
