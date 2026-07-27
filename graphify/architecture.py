@@ -35,7 +35,7 @@ LEVEL_TYPES = {
     "component": {"component"},
     "code": {"code"},
 }
-TRUSTED_RESOLUTIONS = frozenset({"same_file", "same_go_package", "go_import"})
+TRUSTED_RESOLUTIONS = frozenset({"same_file", "same_go_package", "go_import", "go_import_type"})
 
 
 def default_model() -> dict[str, Any]:

@@ -237,13 +237,8 @@ def test_origin_file_is_not_serialized_into_extract_output(tmp_path):
     assert len({node["id"] for node in path_nodes}) == 2
 
 
-def test_go_imported_type_stubs_do_not_collide_across_source_files(tmp_path):
-    """#1462 (dedicated extractors): the imported-type-stub disambiguation (the
-    ``origin_file`` key) landed only in the generic extractor, so the six dedicated
-    extractors (Go, Rust, Julia, Fortran, PowerShell, ObjC) still collapsed same-label
-    cross-file stubs into one conflated bare-id node — a false cross-package link.
-    They must stay distinct per file while keeping ``source_file`` empty so the #1402
-    rewire still collapses them onto a real definition when one exists."""
+def test_go_external_qualified_types_do_not_create_project_type_stubs(tmp_path):
+    """External package types stay out of the project graph until proven local."""
     first = tmp_path / "a/use_a.go"
     second = tmp_path / "b/use_b.go"
     first.parent.mkdir(parents=True)
@@ -254,9 +249,7 @@ def test_go_imported_type_stubs_do_not_collide_across_source_files(tmp_path):
     result = extract([first, second], cache_root=tmp_path)
     widget_nodes = [node for node in result["nodes"] if node["label"] == "ext.Widget"]
 
-    assert len(widget_nodes) == 2
-    assert len({node["id"] for node in widget_nodes}) == 2
-    assert all(not node.get("source_file") for node in widget_nodes)
+    assert widget_nodes == []
 
 
 def test_go_qualified_stdlib_symbols_never_bind_to_project_symbols(tmp_path):
@@ -310,6 +303,38 @@ def test_go_qualified_local_import_has_go_import_provenance(tmp_path):
     assert edge["confidence"] == "EXTRACTED"
     assert edge["resolution"] == "go_import"
     assert edge["import_path"] == "example.test/app/internal/service"
+
+
+def test_go_qualified_local_imported_type_has_go_import_type_provenance(tmp_path):
+    """A JSON-RPC-style imported type resolves to its exact local package."""
+    (tmp_path / "go.mod").write_text("module example.test/app\n\ngo 1.22\n", encoding="utf-8")
+    transport = tmp_path / "internal/mcp/transport"
+    jsonrpc = tmp_path / "internal/jsonrpc"
+    transport.mkdir(parents=True)
+    jsonrpc.mkdir(parents=True)
+    (jsonrpc / "types.go").write_text(
+        "package jsonrpc\n\ntype JSONRPCError struct{}\n", encoding="utf-8"
+    )
+    (transport / "handler.go").write_text(
+        'package transport\n\nimport "example.test/app/internal/jsonrpc"\n\n'
+        "func WriteError(err *jsonrpc.JSONRPCError) {}\n",
+        encoding="utf-8",
+    )
+
+    result = extract(
+        [transport / "handler.go", jsonrpc / "types.go"], cache_root=tmp_path, root=tmp_path
+    )
+    nodes = {node["id"]: node for node in result["nodes"]}
+    writer = next(node_id for node_id, node in nodes.items() if node["label"] == "WriteError()")
+    jsonrpc_error = next(
+        node_id for node_id, node in nodes.items() if node["label"] == "JSONRPCError"
+    )
+    edge = next(edge for edge in result["edges"] if edge["source"] == writer and edge["target"] == jsonrpc_error)
+
+    assert edge["relation"] == "references"
+    assert edge["confidence"] == "EXTRACTED"
+    assert edge["resolution"] == "go_import_type"
+    assert edge["import_path"] == "example.test/app/internal/jsonrpc"
 
 
 def test_extract_updates_raw_call_callers_after_duplicate_id_disambiguation(tmp_path):

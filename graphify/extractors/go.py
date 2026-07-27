@@ -80,6 +80,7 @@ def extract_go(path: Path) -> dict:
     seen_ids: set[str] = set()
     function_bodies: list[tuple[str, object]] = []
     go_imported_pkgs: dict[str, str] = {}  # local package name/alias -> import path
+    raw_type_refs: list[dict] = []
 
     def add_node(nid: str, label: str, line: int) -> None:
         if nid not in seen_ids:
@@ -141,6 +142,34 @@ def extract_go(path: Path) -> dict:
             })
         return nid
 
+    def emit_type_ref(
+        source_nid: str,
+        ref_name: str,
+        role: str,
+        relation: str,
+        line: int,
+        context: str | None = None,
+    ) -> None:
+        """Emit a local type edge or defer a package-qualified one for proof."""
+        qualifier, separator, type_name = ref_name.partition(".")
+        if separator and qualifier in go_imported_pkgs and type_name:
+            raw_type_refs.append({
+                "source_nid": source_nid,
+                "type_name": type_name,
+                "relation": relation,
+                "context": context,
+                "language": "go",
+                "package_qualified": True,
+                "qualifier": qualifier,
+                "import_path": go_imported_pkgs[qualifier],
+                "source_file": str_path,
+                "source_location": f"L{line}",
+            })
+            return
+        target_nid = ensure_named_node(ref_name, line)
+        if target_nid != source_nid:
+            add_edge(source_nid, target_nid, relation, line, context=context)
+
     def emit_go_method_refs(func_node, func_nid: str, line: int) -> None:
         params = func_node.child_by_field_name("parameters")
         if params is not None:
@@ -152,9 +181,7 @@ def extract_go(path: Path) -> dict:
                 _go_collect_type_refs(type_node, source, False, refs)
                 for ref_name, role in refs:
                     ctx = "generic_arg" if role == "generic_arg" else "parameter_type"
-                    tgt = ensure_named_node(ref_name, line)
-                    if tgt != func_nid:
-                        add_edge(func_nid, tgt, "references", line, context=ctx)
+                    emit_type_ref(func_nid, ref_name, role, "references", line, ctx)
         result = func_node.child_by_field_name("result")
         if result is not None:
             if result.type == "parameter_list":
@@ -171,17 +198,13 @@ def extract_go(path: Path) -> dict:
                     _go_collect_type_refs(type_node, source, False, refs)
                     for ref_name, role in refs:
                         ctx = "generic_arg" if role == "generic_arg" else "return_type"
-                        tgt = ensure_named_node(ref_name, line)
-                        if tgt != func_nid:
-                            add_edge(func_nid, tgt, "references", line, context=ctx)
+                        emit_type_ref(func_nid, ref_name, role, "references", line, ctx)
             else:
                 refs = []
                 _go_collect_type_refs(result, source, False, refs)
                 for ref_name, role in refs:
                     ctx = "generic_arg" if role == "generic_arg" else "return_type"
-                    tgt = ensure_named_node(ref_name, line)
-                    if tgt != func_nid:
-                        add_edge(func_nid, tgt, "references", line, context=ctx)
+                    emit_type_ref(func_nid, ref_name, role, "references", line, ctx)
 
     def walk(node) -> None:
         t = node.type
@@ -272,16 +295,17 @@ def extract_go(path: Path) -> dict:
                             refs: list[tuple[str, str]] = []
                             _go_collect_type_refs(type_node, source, False, refs)
                             for ref_name, role in refs:
-                                tgt = ensure_named_node(ref_name, field.start_point[0] + 1)
-                                if tgt == type_nid:
-                                    continue
                                 if not has_name and role == "type":
-                                    add_edge(type_nid, tgt, "embeds",
-                                             field.start_point[0] + 1)
+                                    emit_type_ref(
+                                        type_nid, ref_name, role, "embeds",
+                                        field.start_point[0] + 1,
+                                    )
                                 else:
                                     ctx = "generic_arg" if role == "generic_arg" else "field"
-                                    add_edge(type_nid, tgt, "references",
-                                             field.start_point[0] + 1, context=ctx)
+                                    emit_type_ref(
+                                        type_nid, ref_name, role, "references",
+                                        field.start_point[0] + 1, ctx,
+                                    )
                 elif type_body.type == "interface_type":
                     for elem in type_body.children:
                         if elem.type != "type_elem":
@@ -291,15 +315,13 @@ def extract_go(path: Path) -> dict:
                             if sub.is_named:
                                 _go_collect_type_refs(sub, source, False, refs)
                         for ref_name, role in refs:
-                            tgt = ensure_named_node(ref_name, elem.start_point[0] + 1)
-                            if tgt == type_nid:
-                                continue
                             if role == "type":
-                                add_edge(type_nid, tgt, "embeds",
-                                         elem.start_point[0] + 1)
+                                emit_type_ref(type_nid, ref_name, role, "embeds", elem.start_point[0] + 1)
                             else:
-                                add_edge(type_nid, tgt, "references",
-                                         elem.start_point[0] + 1, context="generic_arg")
+                                emit_type_ref(
+                                    type_nid, ref_name, role, "references",
+                                    elem.start_point[0] + 1, "generic_arg",
+                                )
             return
 
         if t == "import_declaration":
@@ -428,4 +450,9 @@ def extract_go(path: Path) -> dict:
         if src in valid_ids and (tgt in valid_ids or edge["relation"] in ("imports", "imports_from")):
             clean_edges.append(edge)
 
-    return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
+    return {
+        "nodes": nodes,
+        "edges": clean_edges,
+        "raw_calls": raw_calls,
+        "raw_type_refs": raw_type_refs,
+    }

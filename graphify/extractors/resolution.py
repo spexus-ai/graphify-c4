@@ -657,6 +657,7 @@ def _disambiguate_colliding_node_ids(
     edges: list[dict],
     raw_calls: list[dict],
     root: Path,
+    raw_type_refs: list[dict] | None = None,
 ) -> None:
     """Rewrite only colliding node IDs, using source path as the disambiguator.
 
@@ -785,13 +786,17 @@ def _disambiguate_colliding_node_ids(
         elif edge.get("target") in unambiguous_remaps:
             edge["target"] = unambiguous_remaps[str(edge["target"])]
 
-    for raw_call in raw_calls:
-        call_source_key = _source_key(str(raw_call.get("source_file", "")), root)
-        caller_key = (raw_call.get("caller_nid", ""), call_source_key)
-        if caller_key in remap:
-            raw_call["caller_nid"] = remap[caller_key]
-        elif raw_call.get("caller_nid") in unambiguous_remaps:
-            raw_call["caller_nid"] = unambiguous_remaps[str(raw_call["caller_nid"])]
+    for raw_items, source_field in (
+        (raw_calls, "caller_nid"),
+        (raw_type_refs or [], "source_nid"),
+    ):
+        for raw_item in raw_items:
+            call_source_key = _source_key(str(raw_item.get("source_file", "")), root)
+            caller_key = (raw_item.get(source_field, ""), call_source_key)
+            if caller_key in remap:
+                raw_item[source_field] = remap[caller_key]
+            elif raw_item.get(source_field) in unambiguous_remaps:
+                raw_item[source_field] = unambiguous_remaps[str(raw_item[source_field])]
 
 def _is_type_like_definition(node: dict) -> bool:
     if node.get("type") == "namespace":

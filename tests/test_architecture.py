@@ -140,6 +140,19 @@ def test_suspect_dependencies_require_namespace_or_import_proof():
     }]
 
 
+def test_go_import_type_evidence_is_not_suspect():
+    graph = {
+        **GRAPH,
+        "links": [{
+            **GRAPH["links"][0],
+            "confidence": "EXTRACTED",
+            "resolution": "go_import_type",
+        }],
+    }
+
+    assert suspect_dependencies(build_projection(MODEL, graph), graph) == []
+
+
 def test_projection_keeps_intra_component_code_relationships():
     graph = {
         "nodes": [

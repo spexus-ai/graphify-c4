@@ -4650,6 +4650,7 @@ def extract(
     all_nodes: list[dict] = []
     all_edges: list[dict] = []
     all_raw_calls: list[dict] = []
+    all_raw_type_refs: list[dict] = []
     # Extractors retain a convenient basename in ``source_file``.  Keep the
     # project-relative directory separately while aggregating: Go package
     # imports are directory-addressed and two ``service.go`` files can coexist.
@@ -4658,6 +4659,7 @@ def extract(
         all_nodes.extend(result.get("nodes", []))
         all_edges.extend(result.get("edges", []))
         all_raw_calls.extend(result.get("raw_calls", []))
+        all_raw_type_refs.extend(result.get("raw_type_refs", []))
         try:
             relative_dir = source_path.resolve().relative_to(root.resolve()).parent.as_posix()
         except (OSError, RuntimeError, ValueError):
@@ -4851,6 +4853,10 @@ def extract(
                 cn = rc.get("caller_nid")
                 if cn in sym_remap:
                     rc["caller_nid"] = sym_remap[cn]
+            for type_ref in all_raw_type_refs:
+                source_nid = type_ref.get("source_nid")
+                if source_nid in sym_remap:
+                    type_ref["source_nid"] = sym_remap[source_nid]
             for old_nid, new_nid in sym_remap.items():
                 project_dir = nid_to_project_dir.pop(old_nid, None)
                 if project_dir is not None:
@@ -4980,7 +4986,9 @@ def extract(
     # graph is identical regardless of scan root (#2072).
     _repoint_python_package_imports(paths, all_nodes, all_edges, root)
     _merge_swift_extensions(per_file, all_nodes, all_edges)
-    _disambiguate_colliding_node_ids(all_nodes, all_edges, all_raw_calls, root)
+    _disambiguate_colliding_node_ids(
+        all_nodes, all_edges, all_raw_calls, root, raw_type_refs=all_raw_type_refs
+    )
     _canonicalize_csharp_namespace_nodes(all_nodes, all_edges)
     # PHP namespace/use disambiguation must run BEFORE the unique-stub rewire:
     # the false merge (#1923) happens inside the rewire when a bare-name stub
@@ -5128,6 +5136,12 @@ def extract(
         if str(n.get("source_file", "")).endswith(".go")
         and str(n.get("label", "")).endswith("()")
     }
+    go_type_nids = {
+        n["id"] for n in all_nodes
+        if str(n.get("source_file", "")).endswith(".go")
+        and not str(n.get("label", "")).endswith(".go")
+        and not str(n.get("label", "")).endswith("()")
+    }
     # Class defs are callable only via their constructor; they are frequently passed
     # as descriptive values (`select(Model)`, exception tuples), not invoked. Exclude
     # them from the indirect_call guard below to avoid false edges (#2137).
@@ -5231,6 +5245,45 @@ def extract(
             == package_dir
         ]
         return candidates[0] if len(candidates) == 1 else None
+
+    def _resolve_go_import_type(raw_type_ref: dict[str, Any]) -> str | None:
+        import_path = str(raw_type_ref.get("import_path", ""))
+        if not go_module_path or not import_path.startswith(go_module_path + "/"):
+            return None
+        package_dir = import_path[len(go_module_path) + 1:].rstrip("/")
+        candidates = [
+            candidate for candidate in global_label_to_nids.get(str(raw_type_ref.get("type_name", "")), [])
+            if candidate in go_type_nids
+            and (nid_to_project_dir.get(candidate) or _go_source_dir(nid_to_source_file.get(candidate, "")))
+            == package_dir
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    # Type references use the same import proof as qualified function calls.
+    # ``jsonrpc.JSONRPCError`` is a dependency on the exact imported local
+    # package, while ``http.Client`` remains an intentionally unresolved
+    # external type rather than becoming a random project-local ``Client``.
+    for raw_type_ref in all_raw_type_refs:
+        target = _resolve_go_import_type(raw_type_ref)
+        source = raw_type_ref["source_nid"]
+        if target is None or target == source or (source, target) in existing_pairs:
+            continue
+        existing_pairs.add((source, target))
+        edge = {
+            "source": source,
+            "target": target,
+            "relation": raw_type_ref.get("relation", "references"),
+            "confidence": "EXTRACTED",
+            "confidence_score": 1.0,
+            "resolution": "go_import_type",
+            "import_path": raw_type_ref.get("import_path", ""),
+            "source_file": raw_type_ref.get("source_file", ""),
+            "source_location": raw_type_ref.get("source_location"),
+            "weight": 1.0,
+        }
+        if raw_type_ref.get("context"):
+            edge["context"] = raw_type_ref["context"]
+        all_edges.append(edge)
 
     for rc in all_raw_calls:
         callee = rc.get("callee", "")

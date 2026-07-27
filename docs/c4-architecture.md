@@ -79,8 +79,8 @@ dependencies, for example a frontend container reaching any datastore:
   missing from `relations`, and rule violations.
 - `audit --suspect` lists cross-component dependencies that are based on a
   name-only or unknown resolution rather than a same-file/same-package match or
-  an explicit local Go import. Treat these as leads for review, not as confirmed
-  architecture violations.
+  an explicit local Go import (including an imported Go type). Treat these as
+  leads for review, not as confirmed architecture violations.
 
 Every observed relationship in `architecture.json` retains the code node IDs,
 source file, source location, resolution provenance, and
