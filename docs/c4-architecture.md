@@ -104,8 +104,9 @@ graphify architecture diff \
 The JSON payload uses `graphify.architecture-diff/v1` and contains a diff for
 each C4 level: `context`, `container`, `component`, and `code`. Each level is
 rolled up *before* comparison, so a pair of offsetting code changes does not
-become a false added or removed component dependency. Nodes retain both their
-direct status and descendant Code delta; relationships are `added`, `removed`,
+become a false added or removed component dependency. `added` and `removed`
+node statuses describe only direct C4-element lifecycle; a stable component
+whose Code changes is `modified` and retains its descendant delta. Relationships are `added`, `removed`,
 `modified` when their evidence count changes, or `unchanged`.
 
 The HTML view switches levels and drills down on double-click. It hides

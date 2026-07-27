@@ -215,7 +215,8 @@ def test_architecture_diff_rolls_code_changes_to_every_c4_level():
     container = next(item for item in diff["levels"]["container"]["elements"] if item["id"] == "front")
     context = next(item for item in diff["levels"]["context"]["elements"] if item["id"] == "system")
     assert component["descendant_delta"]["added"] == 1
-    assert component["status"] == "added"
+    assert component["direct_status"] == "unchanged"
+    assert component["status"] == "modified"
     assert container["descendant_delta"]["added"] == 1
     assert context["descendant_delta"]["added"] == 1
     relation = next(item for item in diff["levels"]["container"]["relations"] if item["source"] == "front")

@@ -624,9 +624,9 @@ def architecture_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str
             descendant = {state: descendants[element_id][state] for state in ("added", "removed", "modified")}
             effective_status = direct_status
             if effective_status == "unchanged" and any(descendant.values()):
-                effective_status = "added" if descendant["added"] and not (descendant["removed"] or descendant["modified"]) else (
-                    "removed" if descendant["removed"] and not (descendant["added"] or descendant["modified"]) else "modified"
-                )
+                # A stable C4 element with changing implementation is modified,
+                # never added or removed.  Direct status alone conveys lifecycle.
+                effective_status = "modified"
             element = new or old or {}
             elements.append({
                 "id": element_id,
