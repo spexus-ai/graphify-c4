@@ -210,3 +210,5 @@ def test_architecture_html_cli_writes_interactive_c4_view(monkeypatch, tmp_path,
     assert "forceAtlas2Based" in html
     assert "Drag nodes to arrange them" in html
     assert "observed_code_relations" in html
+    assert "select-all-cb" in html
+    assert "node-filter" in html
