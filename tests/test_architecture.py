@@ -203,6 +203,7 @@ def test_architecture_diff_rolls_code_changes_to_every_c4_level():
         "links": [
             *GRAPH["links"],
             {"source": "new", "target": "db", "relation": "calls", "confidence": "EXTRACTED"},
+            {"source": "ui", "target": "db", "relation": "calls", "confidence": "EXTRACTED"},
         ],
     }
     after = build_projection(MODEL, after_graph)
@@ -211,10 +212,12 @@ def test_architecture_diff_rolls_code_changes_to_every_c4_level():
 
     assert diff["schema"] == "graphify.architecture-diff/v1"
     assert next(item for item in diff["levels"]["code"]["elements"] if item["id"] == "code:new")["status"] == "added"
+    assert next(item for item in diff["levels"]["code"]["elements"] if item["id"] == "code:ui")["status"] == "modified"
     component = next(item for item in diff["levels"]["component"]["elements"] if item["id"] == "front.ui")
     container = next(item for item in diff["levels"]["container"]["elements"] if item["id"] == "front")
     context = next(item for item in diff["levels"]["context"]["elements"] if item["id"] == "system")
     assert component["descendant_delta"]["added"] == 1
+    assert component["descendant_delta"]["modified"] == 1
     assert component["direct_status"] == "unchanged"
     assert component["status"] == "modified"
     assert container["descendant_delta"]["added"] == 1

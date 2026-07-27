@@ -569,13 +569,32 @@ def _rolled_diff_relations(projection: dict[str, Any], level: str) -> dict[tuple
 def _code_change_statuses(before: dict[str, Any], after: dict[str, Any]) -> dict[str, str]:
     before_code = {key: value for key, value in _element_index(before).items() if value.get("c4_type") == "code"}
     after_code = {key: value for key, value in _element_index(after).items() if value.get("c4_type") == "code"}
+    before_relations = {
+        (item["source"], item["target"], item["kind"]): len(item.get("evidence", []))
+        for item in before.get("observed_code_relations", [])
+    }
+    after_relations = {
+        (item["source"], item["target"], item["kind"]): len(item.get("evidence", []))
+        for item in after.get("observed_code_relations", [])
+    }
+    # An outgoing relation describes a code element's own implementation.  An
+    # incoming relation only means another caller changed, so it must not mark
+    # the target as modified.
+    changed_sources = {
+        key[0]
+        for key in set(before_relations) | set(after_relations)
+        if before_relations.get(key, 0) != after_relations.get(key, 0)
+    }
     statuses: dict[str, str] = {}
     for element_id in sorted(set(before_code) | set(after_code)):
         if element_id not in before_code:
             statuses[element_id] = "added"
         elif element_id not in after_code:
             statuses[element_id] = "removed"
-        elif _element_fingerprint(before_code[element_id]) != _element_fingerprint(after_code[element_id]):
+        elif (
+            _element_fingerprint(before_code[element_id]) != _element_fingerprint(after_code[element_id])
+            or element_id in changed_sources
+        ):
             statuses[element_id] = "modified"
         else:
             statuses[element_id] = "unchanged"

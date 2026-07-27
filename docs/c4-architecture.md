@@ -109,6 +109,12 @@ node statuses describe only direct C4-element lifecycle; a stable component
 whose Code changes is `modified` and retains its descendant delta. Relationships are `added`, `removed`,
 `modified` when their evidence count changes, or `unchanged`.
 
+At Code level a stable symbol is `modified` when its structural metadata or an
+outgoing extracted relationship changes. This deliberately does not classify a
+callee as modified merely because a new caller references it. Pure body edits
+that leave the extracted structure unchanged need a future AST body fingerprint
+to be detectable.
+
 The HTML view switches levels and drills down on double-click. It hides
 unchanged facts by default, but can show them for context. A historical model
 is ideal; if a common current model is used for both revisions, treat the
