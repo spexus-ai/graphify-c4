@@ -65,10 +65,10 @@ dependencies, for example a frontend container reaching any datastore:
   `component`, or `code` level. During `sync`, mapped code nodes become
   generated `code:<graph-node-id>` children of their component; the contract
   itself remains compact and declares only architectural boundaries.
-- `html` writes `graphify-out/architecture.html`, an offline browser view with
-  an interactive C4 relationship graph, level selection and click-to-drill-down
-  navigation. Declared relations are solid green arrows; code-derived evidence
-  is orange and dashed. The graph supports pan and zoom without external assets.
+- `html` writes `graphify-out/architecture.html`, an interactive C4 view using
+  the same vis-network renderer as Graphify's `graph.html`: force-directed
+  layout, drag, zoom, search and node inspection. Declared relations are solid
+  green arrows; code-derived evidence is orange and dashed.
 - `up <node>` maps a code node to its component, container, and system.
 - `down <element> --to code` returns the implementing graph node IDs.
 - `impact <node-or-file>` performs a reverse dependency walk and returns the
