@@ -511,7 +511,7 @@ def _run_cli() -> None:
         print("  uninstall               remove graphify from all detected platforms in one shot")
         print("    --purge                 also delete graphify-out/ directory")
         print("  architecture <command>  project code facts onto a declared C4 architecture model")
-        print("    init|sync|validate|audit|view|html|up|down|impact  run 'graphify architecture --help' for details")
+        print("    init|sync|validate|audit|view|html|diff|up|down|impact  run 'graphify architecture --help' for details")
         print("  path \"A\" \"B\"            shortest path between two nodes in graph.json")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
         print("  explain \"X\"             plain-language explanation of a node and its neighbors")

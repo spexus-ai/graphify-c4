@@ -19,6 +19,7 @@ from graphify.paths import write_json_atomic, write_text_atomic
 
 
 SCHEMA = "graphify.architecture/v1"
+DIFF_SCHEMA = "graphify.architecture-diff/v1"
 C4_TYPES = {
     "person",
     "software_system",
@@ -522,6 +523,151 @@ def view(projection: dict[str, Any], level: str, focus: str | None = None) -> di
     }
 
 
+def load_projection(path: Path) -> dict[str, Any]:
+    """Load a previously synced C4 projection for historical comparison."""
+    try:
+        projection = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"architecture projection not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"architecture projection is not valid JSON: {path}: {exc}") from exc
+    if not isinstance(projection, dict) or projection.get("schema") != SCHEMA:
+        raise ValueError(f"architecture projection has unsupported schema: {path}")
+    if not isinstance(projection.get("elements"), list):
+        raise ValueError(f"architecture projection has no elements array: {path}")
+    return projection
+
+
+def _element_fingerprint(element: dict[str, Any]) -> str:
+    """Stable structural identity used to detect a changed, non-replaced element."""
+    fields = ("c4_type", "parent", "name", "description", "source_file", "graph_node_id")
+    return json.dumps({field: element.get(field) for field in fields}, sort_keys=True, ensure_ascii=False)
+
+
+def _rolled_diff_relations(projection: dict[str, Any], level: str) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+    """Roll one snapshot to a C4 level before comparing it with another snapshot."""
+    elements = _element_index(projection)
+    source_relations = projection.get("observed_code_relations", []) if level == "code" else projection.get("observed_relations", [])
+    all_relations = [(relation, "observed") for relation in source_relations]
+    if level != "code":
+        all_relations.extend((relation, "declared") for relation in projection.get("declared_relations", []))
+    rolled: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for relation, origin in all_relations:
+        source = _ancestor(str(relation.get("source", "")), elements, LEVEL_TYPES[level])
+        target = _ancestor(str(relation.get("target", "")), elements, LEVEL_TYPES[level])
+        if source is None or target is None or source == target:
+            continue
+        key = (source, target, str(relation.get("kind", "uses")), origin)
+        item = rolled.setdefault(
+            key,
+            {"source": source, "target": target, "kind": key[2], "origin": origin, "evidence_count": 0},
+        )
+        item["evidence_count"] += len(relation.get("evidence", [])) if origin == "observed" else 1
+    return rolled
+
+
+def _code_change_statuses(before: dict[str, Any], after: dict[str, Any]) -> dict[str, str]:
+    before_code = {key: value for key, value in _element_index(before).items() if value.get("c4_type") == "code"}
+    after_code = {key: value for key, value in _element_index(after).items() if value.get("c4_type") == "code"}
+    statuses: dict[str, str] = {}
+    for element_id in sorted(set(before_code) | set(after_code)):
+        if element_id not in before_code:
+            statuses[element_id] = "added"
+        elif element_id not in after_code:
+            statuses[element_id] = "removed"
+        elif _element_fingerprint(before_code[element_id]) != _element_fingerprint(after_code[element_id]):
+            statuses[element_id] = "modified"
+        else:
+            statuses[element_id] = "unchanged"
+    return statuses
+
+
+def architecture_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Compare two C4 projections at every C4 level without mixing roll-up stages."""
+    before_elements, after_elements = _element_index(before), _element_index(after)
+    code_status = _code_change_statuses(before, after)
+    descendants: dict[str, Counter[str]] = defaultdict(Counter)
+    for projection, status_source in ((before, "removed"), (after, "added")):
+        elements = _element_index(projection)
+        for code_id, status in code_status.items():
+            if status != status_source or code_id not in elements:
+                continue
+            current: str | None = code_id
+            while current is not None:
+                descendants[current][status] += 1
+                parent = elements.get(current, {}).get("parent")
+                current = parent if isinstance(parent, str) else None
+    for code_id, status in code_status.items():
+        if status != "modified":
+            continue
+        current: str | None = code_id
+        while current is not None:
+            descendants[current][status] += 1
+            parent = after_elements.get(current, {}).get("parent")
+            current = parent if isinstance(parent, str) else None
+
+    levels: dict[str, dict[str, Any]] = {}
+    for level in LEVELS:
+        selected_before = {key: value for key, value in before_elements.items() if value.get("c4_type") in LEVEL_TYPES[level]}
+        selected_after = {key: value for key, value in after_elements.items() if value.get("c4_type") in LEVEL_TYPES[level]}
+        elements: list[dict[str, Any]] = []
+        for element_id in sorted(set(selected_before) | set(selected_after)):
+            old, new = selected_before.get(element_id), selected_after.get(element_id)
+            if old is None:
+                direct_status = "added"
+            elif new is None:
+                direct_status = "removed"
+            elif _element_fingerprint(old) != _element_fingerprint(new):
+                direct_status = "modified"
+            else:
+                direct_status = "unchanged"
+            descendant = {state: descendants[element_id][state] for state in ("added", "removed", "modified")}
+            effective_status = direct_status
+            if effective_status == "unchanged" and any(descendant.values()):
+                effective_status = "added" if descendant["added"] and not (descendant["removed"] or descendant["modified"]) else (
+                    "removed" if descendant["removed"] and not (descendant["added"] or descendant["modified"]) else "modified"
+                )
+            element = new or old or {}
+            elements.append({
+                "id": element_id,
+                "name": element.get("name", element_id),
+                "c4_type": element.get("c4_type", "unknown"),
+                "parent": element.get("parent"),
+                "status": effective_status,
+                "direct_status": direct_status,
+                "descendant_delta": descendant,
+                "source_file": element.get("source_file", ""),
+            })
+
+        before_relations, after_relations = _rolled_diff_relations(before, level), _rolled_diff_relations(after, level)
+        relation_rows: list[dict[str, Any]] = []
+        for key in sorted(set(before_relations) | set(after_relations)):
+            old, new = before_relations.get(key), after_relations.get(key)
+            if old is None:
+                status = "added"
+            elif new is None:
+                status = "removed"
+            elif old["evidence_count"] != new["evidence_count"]:
+                status = "modified"
+            else:
+                status = "unchanged"
+            relation = new or old or {}
+            relation_rows.append({
+                **relation,
+                "status": status,
+                "before_evidence_count": old["evidence_count"] if old else 0,
+                "after_evidence_count": new["evidence_count"] if new else 0,
+            })
+        levels[level] = {"level": level, "elements": elements, "relations": relation_rows}
+
+    return {
+        "schema": DIFF_SCHEMA,
+        "before": {"elements": len(before_elements), "unmapped_code_nodes": len(before.get("unmapped_code_nodes", []))},
+        "after": {"elements": len(after_elements), "unmapped_code_nodes": len(after.get("unmapped_code_nodes", []))},
+        "levels": levels,
+    }
+
+
 def resolve_architecture_node(projection: dict[str, Any], value: str) -> str | None:
     elements = _element_index(projection)
     if value in elements:
@@ -711,11 +857,14 @@ Commands:
   audit      list cross-component edges without namespace/import proof
   view       show one C4 level: --level context|container|component|code
   html       write an interactive architecture.html browser view
+  diff       compare two synced projections at Context, Container, Component and Code
   up <node>  raise a code node or C4 id to its C4 ancestors
   down <id>  descend via --to component|container|code
   impact <node-or-file>  reverse-walk dependencies and return C4 components
 
 Common options: --model PATH --graph PATH --out PATH
+
+Diff options: --before PROJECTION --after PROJECTION --out PATH [--html PATH]
 """.rstrip()
 
 
@@ -726,6 +875,50 @@ def dispatch_cli(args: list[str]) -> int:
         return 0
     command = args[0]
     try:
+        if command == "diff":
+            before_path: Path | None = None
+            after_path: Path | None = None
+            output_path = Path("graphify-out/architecture-diff.json")
+            html_output: Path | None = None
+            index = 1
+            while index < len(args):
+                option = args[index]
+                if option in ("--before", "--after", "--out", "--html"):
+                    if index + 1 >= len(args):
+                        raise ValueError(f"{option} needs a path")
+                    value = Path(args[index + 1])
+                    if option == "--before":
+                        before_path = value
+                    elif option == "--after":
+                        after_path = value
+                    elif option == "--out":
+                        output_path = value
+                    else:
+                        html_output = value
+                    index += 2
+                elif option.startswith("--before="):
+                    before_path = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--after="):
+                    after_path = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--out="):
+                    output_path = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--html="):
+                    html_output = Path(option.split("=", 1)[1]); index += 1
+                else:
+                    raise ValueError(f"unknown diff option '{option}'")
+            if before_path is None or after_path is None:
+                raise ValueError("diff needs --before PROJECTION and --after PROJECTION")
+            result = architecture_diff(load_projection(before_path), load_projection(after_path))
+            write_json_atomic(output_path, result, indent=2, ensure_ascii=False)
+            if html_output is not None:
+                from graphify.architecture_diff_html import write_architecture_diff_html
+
+                write_architecture_diff_html(result, html_output)
+            print(f"Wrote architecture diff: {output_path}")
+            if html_output is not None:
+                print(f"Wrote interactive architecture diff: {html_output}")
+            return 0
+
         model_path, graph_path, output_path, rest = _common_paths(args[1:])
         if command == "init":
             if rest:

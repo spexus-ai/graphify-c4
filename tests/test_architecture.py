@@ -4,6 +4,7 @@ import json
 
 import graphify.__main__ as mainmod
 from graphify.architecture import (
+    architecture_diff,
     build_projection,
     conformance,
     down,
@@ -192,6 +193,35 @@ def test_hierarchical_navigation_moves_between_code_component_container_and_cont
     ]
 
 
+def test_architecture_diff_rolls_code_changes_to_every_c4_level():
+    before = build_projection(MODEL, GRAPH)
+    after_graph = {
+        "nodes": [
+            *GRAPH["nodes"],
+            {"id": "new", "label": "newFlow()", "file_type": "code", "source_file": "src/ui/new.ts"},
+        ],
+        "links": [
+            *GRAPH["links"],
+            {"source": "new", "target": "db", "relation": "calls", "confidence": "EXTRACTED"},
+        ],
+    }
+    after = build_projection(MODEL, after_graph)
+
+    diff = architecture_diff(before, after)
+
+    assert diff["schema"] == "graphify.architecture-diff/v1"
+    assert next(item for item in diff["levels"]["code"]["elements"] if item["id"] == "code:new")["status"] == "added"
+    component = next(item for item in diff["levels"]["component"]["elements"] if item["id"] == "front.ui")
+    container = next(item for item in diff["levels"]["container"]["elements"] if item["id"] == "front")
+    context = next(item for item in diff["levels"]["context"]["elements"] if item["id"] == "system")
+    assert component["descendant_delta"]["added"] == 1
+    assert component["status"] == "added"
+    assert container["descendant_delta"]["added"] == 1
+    assert context["descendant_delta"]["added"] == 1
+    relation = next(item for item in diff["levels"]["container"]["relations"] if item["source"] == "front")
+    assert relation["status"] == "modified"
+
+
 def test_impact_rolls_reverse_code_dependencies_to_components():
     projection = build_projection(MODEL, GRAPH)
 
@@ -256,3 +286,29 @@ def test_architecture_html_cli_writes_interactive_c4_view(monkeypatch, tmp_path,
     assert "go_import_type" in html
     assert "maxFocusedCodeNodes = 750" in html
     assert "growConnected" in html
+
+
+def test_architecture_diff_cli_writes_all_levels_and_interactive_view(monkeypatch, tmp_path, capsys):
+    before_path = tmp_path / "before.json"
+    after_path = tmp_path / "after.json"
+    out_path = tmp_path / "diff.json"
+    html_path = tmp_path / "diff.html"
+    before_path.write_text(json.dumps(build_projection(MODEL, GRAPH)), encoding="utf-8")
+    after_path.write_text(json.dumps(build_projection(MODEL, {
+        "nodes": [*GRAPH["nodes"], {"id": "new", "label": "newFlow()", "file_type": "code", "source_file": "src/ui/new.ts"}],
+        "links": [*GRAPH["links"], {"source": "new", "target": "db", "relation": "calls", "confidence": "EXTRACTED"}],
+    })), encoding="utf-8")
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv", [
+        "graphify", "architecture", "diff", "--before", str(before_path), "--after", str(after_path),
+        "--out", str(out_path), "--html", str(html_path),
+    ])
+
+    mainmod.main()
+
+    assert "Wrote architecture diff" in capsys.readouterr().out
+    saved = json.loads(out_path.read_text(encoding="utf-8"))
+    assert set(saved["levels"]) == {"context", "container", "component", "code"}
+    html = html_path.read_text(encoding="utf-8")
+    assert "C4 Architecture Diff" in html
+    assert "double-click a node to drill down" in html

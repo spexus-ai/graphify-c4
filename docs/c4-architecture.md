@@ -15,6 +15,7 @@ graphify architecture validate
 graphify architecture audit --suspect
 graphify architecture view --level container
 graphify architecture html
+graphify architecture diff --before snapshots/before/architecture.json --after snapshots/after/architecture.json --html graphify-out/architecture-diff.html
 ```
 
 `init` refuses to overwrite an existing model. The generated file is a small
@@ -86,3 +87,29 @@ Every observed relationship in `architecture.json` retains the code node IDs,
 source file, source location, resolution provenance, and
 `EXTRACTED`/`INFERRED` confidence. Only reviewed rules backed by `EXTRACTED`
 evidence with trustworthy resolution should fail CI.
+
+## Historical diff
+
+Run `sync` independently for both revisions, preferably with the same C4
+contract, then compare the two projections:
+
+```text
+graphify architecture diff \
+  --before snapshots/f029bdd/architecture.json \
+  --after snapshots/e9e3a82/architecture.json \
+  --out graphify-out/architecture-diff.json \
+  --html graphify-out/architecture-diff.html
+```
+
+The JSON payload uses `graphify.architecture-diff/v1` and contains a diff for
+each C4 level: `context`, `container`, `component`, and `code`. Each level is
+rolled up *before* comparison, so a pair of offsetting code changes does not
+become a false added or removed component dependency. Nodes retain both their
+direct status and descendant Code delta; relationships are `added`, `removed`,
+`modified` when their evidence count changes, or `unchanged`.
+
+The HTML view switches levels and drills down on double-click. It hides
+unchanged facts by default, but can show them for context. A historical model
+is ideal; if a common current model is used for both revisions, treat the
+result as a comparable code-to-boundary projection, not proof that the older
+C4 contract existed at that time.
