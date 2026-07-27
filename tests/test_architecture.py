@@ -411,6 +411,35 @@ def test_workspace_html_cli_writes_all_level_explorer(monkeypatch, tmp_path, cap
     assert "web::ui" in html
 
 
+def test_workspace_composition_relativizes_absolute_source_paths(tmp_path):
+    model = {
+        "schema": "graphify.architecture/v1",
+        "repositories": [{"id": "android", "path": "mobile/android"}],
+        "scope": {"include": ["mobile/android/**"]},
+        "elements": [
+            {"id": "system", "c4_type": "software_system", "name": "System"},
+            {"id": "app", "c4_type": "container", "parent": "system", "name": "Android app"},
+            {"id": "app.code", "c4_type": "component", "parent": "app", "name": "App code",
+             "implementation": [{"path_prefix": "mobile/android"}]},
+        ],
+        "relations": [], "rules": [],
+    }
+    repository = tmp_path / "mobile/android"
+    source_file = repository / "app/src/main/kotlin/com/example/MainActivity.kt"
+    graph_dir = repository / "graphify-out"
+    graph_dir.mkdir(parents=True)
+    (graph_dir / "graph.json").write_text(json.dumps({
+        "nodes": [{"id": "activity", "label": "MainActivity", "file_type": "code", "source_file": str(source_file)}],
+        "links": [],
+    }), encoding="utf-8")
+    model_path = tmp_path / "model.json"
+    model_path.write_text(json.dumps(model), encoding="utf-8")
+
+    composed = compose_workspace_graph(load_model(model_path), tmp_path)
+
+    assert composed["nodes"][0]["source_file"] == "mobile/android/app/src/main/kotlin/com/example/MainActivity.kt"
+
+
 def test_workspace_init_creates_portable_language_neutral_starter(monkeypatch, tmp_path, capsys):
     model_path = tmp_path / "architecture" / "graphify.workspace.c4.json"
     monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)

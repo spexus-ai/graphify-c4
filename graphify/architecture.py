@@ -922,6 +922,7 @@ def compose_workspace_graph(model: dict[str, Any], workspace_root: Path) -> dict
     for repository in repositories:
         repository_id = str(repository["id"])
         repository_path = _normalise_path(repository["path"]).rstrip("/")
+        repository_root = (workspace_root.resolve() / repository_path).resolve()
         graph_path = _workspace_graph_path(workspace_root, repository)
         graph = load_graph(graph_path)
         local_nodes = {
@@ -934,7 +935,16 @@ def compose_workspace_graph(model: dict[str, Any], workspace_root: Path) -> dict
             return f"{repository_id}::{node_id}"
 
         def namespace_source_file(value: object) -> str:
-            source_file = _normalise_path(value)
+            raw_path = Path(str(value or ""))
+            if raw_path.is_absolute():
+                try:
+                    source_file = raw_path.resolve().relative_to(repository_root).as_posix()
+                except ValueError as exc:
+                    raise ValueError(
+                        f"repository '{repository_id}' graph has source_file outside its repository: {value}"
+                    ) from exc
+            else:
+                source_file = _normalise_path(value)
             return f"{repository_path}/{source_file}" if source_file else repository_path
 
         for node_id, node in sorted(local_nodes.items()):
