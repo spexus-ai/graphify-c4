@@ -312,3 +312,5 @@ def test_architecture_diff_cli_writes_all_levels_and_interactive_view(monkeypatc
     html = html_path.read_text(encoding="utf-8")
     assert "C4 Architecture Diff" in html
     assert "double-click a node to drill down" in html
+    assert "#0072B2" in html
+    assert "triangleDown" in html
