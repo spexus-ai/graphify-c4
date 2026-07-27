@@ -65,7 +65,33 @@ dependencies, for example a frontend container reaching any datastore:
 
 A workspace model is the same C4 contract with an additional `repositories`
 catalogue. Each entry has a stable `id`, a path relative to the workspace root,
-and optionally a non-default graph path.
+and optionally a non-default graph path. It is language-neutral: Graphify
+extracts Java, Kotlin/Android, TypeScript/React and other supported source into
+the same observed-facts format before C4 projection.
+
+Start a portable model for an arbitrary multi-repository project:
+
+```text
+graphify architecture workspace init \
+  --system "Storefront" \
+  --repo web=web \
+  --repo api=services/api \
+  --repo android-app=mobile/android
+```
+
+This writes `architecture/graphify.workspace.c4.json` without overwriting an
+existing model. The starter gives each repository a container and one broad
+implementation component, so all four levels are navigable immediately.
+Replace those broad components with real modules after architectural review.
+
+Build one local fact graph per repository before composition. For a source-only
+first pass this has no LLM dependency:
+
+```text
+graphify extract web --out web --code-only
+graphify extract services/api --out services/api --code-only
+graphify extract mobile/android --out mobile/android --code-only
+```
 
 ```json
 {
@@ -80,19 +106,20 @@ and optionally a non-default graph path.
 
 ```text
 graphify architecture workspace html \
-  --model architecture/spexus.c4.json \
+  --model architecture/graphify.workspace.c4.json \
   --root . \
   --out architecture/graphify-out/architecture.json \
   --graph-out architecture/graphify-out/workspace-graph.json \
   --output architecture/graphify-out/architecture.html
 ```
 
-The workspace command namespaces node IDs and source paths (`front::…`,
-`front/src/…`) before C4 projection. This prevents independently extracted
-repositories from merging same-named symbols. It does not infer a
-cross-repository implementation edge: declare HTTP, message, CLI, or datastore
-boundaries as contracts until an extractor gives direct evidence. The generated
-explorer keeps Context, Container, Component, and Code navigation.
+The workspace command namespaces node IDs and source paths (`web::…`,
+`web/src/…`) before C4 projection, and writes graph references relative to the
+workspace root. Consequently the contract and its JSON/HTML outputs can move to
+another checkout or CI machine. It does not infer a cross-repository
+implementation edge: declare HTTP, message, CLI, or datastore boundaries as
+contracts until an extractor gives direct evidence. The generated explorer keeps
+Context, Container, Component, and Code navigation.
 
 ## Navigation and evidence
 

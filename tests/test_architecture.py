@@ -365,8 +365,8 @@ def test_workspace_composition_namespaces_facts_and_keeps_contracts_declared(tmp
         "code:web::main", "code:api::main",
     }
     assert projection["workspace_repositories"] == [
-        {"id": "web", "path": "web", "graph": str(tmp_path / "web/graphify-out/graph.json"), "nodes": 1, "links": 1},
-        {"id": "api", "path": "api", "graph": str(tmp_path / "api/graphify-out/graph.json"), "nodes": 1, "links": 1},
+        {"id": "web", "path": "web", "graph": "web/graphify-out/graph.json", "nodes": 1, "links": 1},
+        {"id": "api", "path": "api", "graph": "api/graphify-out/graph.json", "nodes": 1, "links": 1},
     ]
     assert projection["declared_relations"] == model["relations"]
     assert projection_path.exists() and graph_path.exists()
@@ -409,3 +409,30 @@ def test_workspace_html_cli_writes_all_level_explorer(monkeypatch, tmp_path, cap
     html = html_path.read_text(encoding="utf-8")
     assert "Graphify C4 Architecture" in html
     assert "web::ui" in html
+
+
+def test_workspace_init_creates_portable_language_neutral_starter(monkeypatch, tmp_path, capsys):
+    model_path = tmp_path / "architecture" / "graphify.workspace.c4.json"
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv", [
+        "graphify", "architecture", "workspace", "init", "--model", str(model_path),
+        "--system", "Storefront", "--repo", "web=web", "--repo", "api=services/api",
+        "--repo", "android-app=mobile/android",
+    ])
+
+    mainmod.main()
+
+    model = json.loads(model_path.read_text(encoding="utf-8"))
+    assert "Created workspace architecture model" in capsys.readouterr().out
+    assert validate_model(model) == []
+    assert model["repositories"] == [
+        {"id": "web", "path": "web"},
+        {"id": "api", "path": "services/api"},
+        {"id": "android-app", "path": "mobile/android"},
+    ]
+    assert model["scope"]["include"] == ["web/**", "services/api/**", "mobile/android/**"]
+    assert {item["id"] for item in model["elements"]} >= {
+        "system", "container.web", "component.web.implementation",
+        "container.api", "component.api.implementation",
+        "container.android-app", "component.android-app.implementation",
+    }

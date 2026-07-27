@@ -12,6 +12,7 @@ from collections import Counter, defaultdict, deque
 from fnmatch import fnmatch
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Any, Iterable
 
@@ -52,6 +53,59 @@ def default_model() -> dict[str, Any]:
                 "source": "declared",
             }
         ],
+        "relations": [],
+        "rules": [],
+    }
+
+
+def default_workspace_model(
+    repositories: list[dict[str, str]], system_name: str = "System",
+) -> dict[str, Any]:
+    """Create a portable C4 starter with one refinable component per repository.
+
+    Graphify extracts Java, Kotlin, TypeScript/React, Android and other supported
+    languages into the same fact schema, so the workspace layer intentionally
+    describes repositories and paths rather than technology-specific build tools.
+    Teams replace the broad ``implementation`` components with their own module
+    boundaries as the C4 contract matures.
+    """
+    elements: list[dict[str, Any]] = [{
+        "id": "system",
+        "c4_type": "software_system",
+        "name": system_name,
+        "source": "declared",
+    }]
+    includes: list[str] = []
+    for repository in repositories:
+        repository_id = repository["id"]
+        repository_path = _normalise_path(repository["path"]).rstrip("/")
+        container_id = f"container.{repository_id}"
+        elements.extend((
+            {
+                "id": container_id,
+                "c4_type": "container",
+                "parent": "system",
+                "name": repository_id,
+                "description": f"Repository at {repository_path}",
+            },
+            {
+                "id": f"component.{repository_id}.implementation",
+                "c4_type": "component",
+                "parent": container_id,
+                "name": f"{repository_id} implementation",
+                "description": "Starter component; split it into architectural modules after review.",
+                "implementation": [{"path_prefix": repository_path}],
+            },
+        ))
+        includes.append(f"{repository_path}/**")
+    return {
+        "schema": SCHEMA,
+        "repositories": repositories,
+        "scope": {
+            "include": includes,
+            "exclude": ["**/graphify-out/**", "**/node_modules/**"],
+        },
+        "elements": elements,
         "relations": [],
         "rules": [],
     }
@@ -833,6 +887,21 @@ def _workspace_graph_path(workspace_root: Path, repository: dict[str, Any]) -> P
     return resolved
 
 
+def init_workspace_model(
+    path: Path,
+    repositories: list[dict[str, str]],
+    system_name: str = "System",
+) -> None:
+    """Write a generic, repository-relative workspace C4 starter once."""
+    if path.exists():
+        raise ValueError(f"refusing to overwrite existing workspace architecture model: {path}")
+    model = default_workspace_model(repositories, system_name)
+    errors = validate_model(model)
+    if errors:
+        raise ValueError("generated workspace architecture model has errors:\n" + "\n".join(errors))
+    write_text_atomic(path, json.dumps(model, indent=2, ensure_ascii=False) + "\n")
+
+
 def compose_workspace_graph(model: dict[str, Any], workspace_root: Path) -> dict[str, Any]:
     """Merge repository facts into one namespaced graph for a C4 projection.
 
@@ -896,7 +965,9 @@ def compose_workspace_graph(model: dict[str, Any], workspace_root: Path) -> dict
         repository_summaries.append({
             "id": repository_id,
             "path": repository_path,
-            "graph": str(graph_path),
+            # This output is often checked in or copied into CI artifacts.
+            # Persist a workspace-relative reference, never a machine path.
+            "graph": graph_path.relative_to(workspace_root.resolve()).as_posix(),
             "nodes": len(local_nodes),
             "links": link_count,
         })
@@ -1023,6 +1094,7 @@ Common options: --model PATH --graph PATH --out PATH
 Diff options: --before PROJECTION --after PROJECTION --out PATH [--html PATH]
 
 Workspace options:
+  workspace init --repo ID=PATH [--repo ID=PATH ...] [--model MODEL] [--system NAME]
   workspace sync --model MODEL --root WORKSPACE --out PROJECTION [--graph-out GRAPH]
   workspace html --model MODEL --root WORKSPACE --output HTML [--out PROJECTION] [--graph-out GRAPH]
 """.rstrip()
@@ -1040,7 +1112,55 @@ def dispatch_cli(args: list[str]) -> int:
                 print(architecture_usage())
                 return 0
             workspace_command = args[1]
-            model_path = Path("architecture/spexus.c4.json")
+            model_path = Path("architecture/graphify.workspace.c4.json")
+            if workspace_command == "init":
+                repositories: list[dict[str, str]] = []
+                system_name = "System"
+                index = 2
+                while index < len(args):
+                    option = args[index]
+                    if option in ("--model", "--repo", "--system"):
+                        if index + 1 >= len(args):
+                            raise ValueError(f"{option} needs a value")
+                        value = args[index + 1]
+                        if option == "--model":
+                            model_path = Path(value)
+                        elif option == "--system":
+                            system_name = value
+                        else:
+                            repository_id, separator, repository_path = value.partition("=")
+                            if not separator or not repository_id.strip() or not repository_path.strip():
+                                raise ValueError("--repo needs ID=RELATIVE_PATH")
+                            if Path(repository_path).is_absolute():
+                                raise ValueError("--repo path must be relative to the workspace")
+                            safe_id = re.sub(r"[^A-Za-z0-9_-]+", "-", repository_id.strip()).strip("-")
+                            if not safe_id:
+                                raise ValueError("--repo ID must contain letters or digits")
+                            repositories.append({"id": safe_id, "path": _normalise_path(repository_path)})
+                        index += 2
+                    elif option.startswith("--model="):
+                        model_path = Path(option.split("=", 1)[1]); index += 1
+                    elif option.startswith("--system="):
+                        system_name = option.split("=", 1)[1]; index += 1
+                    elif option.startswith("--repo="):
+                        value = option.split("=", 1)[1]
+                        repository_id, separator, repository_path = value.partition("=")
+                        if not separator or not repository_id.strip() or not repository_path.strip():
+                            raise ValueError("--repo needs ID=RELATIVE_PATH")
+                        if Path(repository_path).is_absolute():
+                            raise ValueError("--repo path must be relative to the workspace")
+                        safe_id = re.sub(r"[^A-Za-z0-9_-]+", "-", repository_id.strip()).strip("-")
+                        if not safe_id:
+                            raise ValueError("--repo ID must contain letters or digits")
+                        repositories.append({"id": safe_id, "path": _normalise_path(repository_path)})
+                        index += 1
+                    else:
+                        raise ValueError(f"unknown workspace init option '{option}'")
+                if not repositories:
+                    raise ValueError("workspace init needs at least one --repo ID=RELATIVE_PATH")
+                init_workspace_model(model_path, repositories, system_name)
+                print(f"Created workspace architecture model: {model_path}")
+                return 0
             workspace_root = Path(".")
             output_path = Path("architecture/graphify-out/architecture.json")
             graph_output_path: Path | None = Path("architecture/graphify-out/workspace-graph.json")
