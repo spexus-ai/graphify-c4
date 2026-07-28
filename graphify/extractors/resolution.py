@@ -138,6 +138,32 @@ def _read_tsconfig_aliases(tsconfig: Path, base_dir: Path, seen: set) -> dict[st
         if extended_path.exists():
             aliases.update(_read_tsconfig_aliases(extended_path, extended_path.parent, seen))
 
+    # Solution-style TypeScript configurations often have no compiler options
+    # themselves; they point at the browser/server configs through
+    # ``references``.  Those referenced configs are still the authority for
+    # path aliases used by their source trees.  Without this, an import such as
+    # ``@/features/editor`` turns into an external reference even though the
+    # referenced app config inherits the alias from a base config.
+    references = data.get("references")
+    if isinstance(references, list):
+        for reference in references:
+            if not isinstance(reference, dict):
+                continue
+            ref_path = reference.get("path")
+            if not isinstance(ref_path, str) or not ref_path:
+                continue
+            referenced_path = (base_dir / ref_path).resolve()
+            if referenced_path.is_dir():
+                referenced_path = referenced_path / "tsconfig.json"
+            elif not referenced_path.suffix:
+                referenced_path = referenced_path.with_suffix(".json")
+            if referenced_path.exists():
+                aliases.update(
+                    _read_tsconfig_aliases(
+                        referenced_path, referenced_path.parent, seen,
+                    )
+                )
+
     # tsconfig `paths` are resolved relative to `baseUrl` (itself relative to
     # the tsconfig's directory), not the tsconfig directory directly. Honoring
     # baseUrl is required for the common monorepo / NestJS layout where

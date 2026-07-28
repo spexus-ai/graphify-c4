@@ -513,6 +513,31 @@ def test_tsconfig_array_extends_alias_resolves_existing_ts_file(tmp_path: Path):
     assert _has_edge(result, "src/routes/page.ts", "src/lib/types/type-helpers.ts")
 
 
+def test_tsconfig_project_reference_inherits_path_aliases(tmp_path: Path):
+    """Solution-style root configs delegate aliases to referenced app configs."""
+    _write(
+        tmp_path / "tsconfig.json",
+        json.dumps({"references": [{"path": "./tsconfig.app.json"}]}),
+    )
+    _write(
+        tmp_path / "tsconfig.app.json",
+        json.dumps({"extends": "./tsconfig.base.json"}),
+    )
+    _write(
+        tmp_path / "tsconfig.base.json",
+        json.dumps({"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["src/*"]}}}),
+    )
+    target = _write(tmp_path / "src/features/editor/index.ts", "export const Editor = 1\n")
+    importer = _write(
+        tmp_path / "src/pages/page.ts",
+        "import { Editor } from '@/features/editor'\nconsole.log(Editor)\n",
+    )
+
+    result = _extract_for([target, importer], tmp_path)
+
+    assert _has_edge(result, "src/pages/page.ts", "src/features/editor/index.ts")
+
+
 def test_default_import_resolves_to_default_exported_class(tmp_path: Path):
     target = _write(tmp_path / "src/lib/foo.ts", "export default class Foo { id = '' }\n")
     importer = _write(
