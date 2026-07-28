@@ -244,7 +244,7 @@ def test_go_extracts_factory_registered_runtime_relationship(tmp_path):
 type Registry interface { Register(Provider) }
 type Provider interface{}
 type RegistryImpl struct{}
-func NewRegistry() Registry { return &RegistryImpl{} }
+func makeRegistry() Registry { return &RegistryImpl{} }
 func (*RegistryImpl) Register(Provider) {}
 """,
         encoding="utf-8",
@@ -253,11 +253,11 @@ func (*RegistryImpl) Register(Provider) {}
         """package service
 
 type ProviderImpl struct{}
-func NewProvider() Provider { return &ProviderImpl{} }
+func makeProvider() Provider { return &ProviderImpl{} }
 type ServiceImpl struct{}
-func NewService(Registry) *ServiceImpl { return &ServiceImpl{} }
+func makeService(Registry) *ServiceImpl { return &ServiceImpl{} }
 type HandlerImpl struct{}
-func NewHandler(*ServiceImpl) *HandlerImpl {
+func makeHandler(*ServiceImpl) *HandlerImpl {
     handler := &HandlerImpl{}
     return handler
 }
@@ -267,17 +267,17 @@ func NewHandler(*ServiceImpl) *HandlerImpl {
     (tmp_path / "setup.go").write_text(
         """package service
 
-func SetupService(registry Registry) *ServiceImpl {
-    service := NewService(registry)
+func composeService(registry Registry) *ServiceImpl {
+    service := makeService(registry)
     return service
 }
 
-func Setup() {
-    registry := NewRegistry()
-    provider := NewProvider()
+func wire() {
+    registry := makeRegistry()
+    provider := makeProvider()
     registry.Register(provider)
-    service := SetupService(registry)
-    _ = NewHandler(service)
+    service := composeService(registry)
+    _ = makeHandler(service)
 }
 """,
         encoding="utf-8",

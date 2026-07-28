@@ -94,10 +94,10 @@ def extract_go(path: Path) -> dict:
     function_bodies: list[tuple[str, object, str]] = []
     go_imported_pkgs: dict[str, str] = {}  # local package name/alias -> import path
     raw_type_refs: list[dict] = []
-    # A dependency-injection setup often constructs an implementation through a
-    # factory, stores it in a local, and then registers it with another factory
-    # product.  Keep this small structural trace for the corpus pass, where both
-    # factory return types can be resolved across files in the Go package.
+    # Dependency injection often constructs an implementation through a call,
+    # stores it in a local, and then registers or passes that value onward. Keep
+    # this structural trace for the corpus pass, where concrete return types can
+    # be resolved across files in the Go package.
     raw_registrations: list[dict] = []
     raw_factory_injections: list[dict] = []
     raw_factory_returns: list[dict] = []
@@ -306,16 +306,13 @@ def extract_go(path: Path) -> dict:
                     emit_type_ref(func_nid, ref_name, role, "references", line, ctx)
 
     def emit_factory_construction_edge(func_node, func_nid: str, func_name: str) -> None:
-        """Link a conventional ``New…`` factory to its direct concrete return.
+        """Link a function to a direct concrete return value.
 
         A factory may expose an interface as its declared return type, while its
         ``return &Concrete{…}`` expression is exact evidence of the runtime
         implementation.  This is deliberately limited to direct composite
         literal returns; forwarding/wrapping factories remain unresolved.
         """
-        if not func_name.startswith(("New", "Setup")):
-            return
-
         def visit(candidate) -> None:
             if candidate.type == "return_statement":
                 expressions = list(candidate.children)
@@ -553,9 +550,10 @@ def extract_go(path: Path) -> dict:
     def emit_factory_registration_trace(caller_nid: str, body_node, caller_name: str) -> None:
         """Record proven Go factory-to-registry wiring for the corpus resolver.
 
-        Only a direct ``name := NewFactory(...)`` binding followed by
-        ``registry.Register…(name)`` qualifies.  This avoids guessing from
-        interface conformance or a matching type name.
+        Only a direct local call binding followed by ``registry.Register…`` or
+        a call that receives that local qualifies. Later corpus resolution still
+        requires both calls to have an exact concrete return type, avoiding
+        guesses from interface conformance or matching names.
         """
         local_factories: dict[str, tuple[str, int, str]] = {}
         local_composites: dict[str, tuple[str, int]] = {}
@@ -578,7 +576,7 @@ def extract_go(path: Path) -> dict:
                     return None
                 name = _read_text(field, source)
                 import_path = go_imported_pkgs[qualifier]
-            return (name, import_path) if name.startswith(("New", "Setup")) else None
+            return (name, import_path) if name else None
 
         def expression_list_items(node) -> list:
             return [child for child in node.children if child.is_named] if node is not None else []
@@ -615,10 +613,10 @@ def extract_go(path: Path) -> dict:
             elif node.type == "call_expression":
                 function = node.child_by_field_name("function")
                 arguments = node.child_by_field_name("arguments")
-                # Passing a local product of one ``New…`` factory to another
-                # factory is direct dependency-injection evidence.  The corpus
-                # pass resolves the two concrete factory returns before adding
-                # a dependency edge, so an interface-typed argument is safe.
+                # Passing a local product of one call to another is direct
+                # dependency-injection evidence. The corpus pass resolves both
+                # concrete returns before adding a dependency edge, so an
+                # interface-typed argument is safe.
                 consumer_factory = direct_factory(node)
                 if consumer_factory:
                     for argument_index, argument in enumerate(expression_list_items(arguments)):
@@ -669,7 +667,7 @@ def extract_go(path: Path) -> dict:
                             "source_file": str_path,
                             "source_location": f"L{node.start_point[0] + 1}",
                         })
-            elif node.type == "return_statement" and caller_name.startswith(("New", "Setup")):
+            elif node.type == "return_statement":
                 values = expression_list_items(next(
                     (child for child in node.children if child.type == "expression_list"), None,
                 ))

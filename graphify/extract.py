@@ -5498,13 +5498,12 @@ def extract(
                 "weight": 1.0,
             })
 
-    # Go dependency-injection wiring: a direct local product of ``NewRegistry``
-    # receiving a direct local product of ``NewProvider`` through ``Register…``
-    # is an exact runtime relationship, even when both factories expose
-    # interfaces.  The per-file extractor records the binding and each factory's
-    # direct ``return &Concrete{…}``; resolve both only within the caller's Go
-    # package and emit the concrete ``registers`` relationship.  No interface
-    # conformance or name-based implementation guessing is involved.
+    # Go dependency-injection wiring: a direct local product of one call
+    # receiving another through ``Register…`` is an exact runtime relationship
+    # once both calls have a concrete return type. The per-file extractor records
+    # the binding and each direct ``return &Concrete{…}``; resolve both only
+    # within the caller's Go package and emit the concrete ``registers``
+    # relationship. No interface conformance or name-based guessing is involved.
     factory_constructs: dict[str, set[str]] = {}
     for edge in all_edges:
         if edge.get("relation") == "constructs":
@@ -5538,10 +5537,9 @@ def extract(
         ]
         return candidates[0] if len(candidates) == 1 else None
 
-    # Composition wrappers such as ``SetupResourceService…`` often return a
-    # local product of a ``New…`` factory.  Propagate only that explicit return
-    # value; this keeps the concrete type traceable when the wrapper exposes an
-    # interface and is passed onward into a handler factory.
+    # A wrapper may return a local product of another call. Propagate only that
+    # explicit return value; this keeps the concrete type traceable when the
+    # wrapper exposes an interface and is passed onward into another component.
     for _ in range(4):
         progressed = False
         for factory_return in all_raw_factory_returns:
