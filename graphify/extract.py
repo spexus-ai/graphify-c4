@@ -1163,6 +1163,7 @@ def extract_js(path: Path) -> dict:
     result = _extract_generic(path, config)
     if "error" not in result:
         _extract_js_rationale(path, result)
+        _extract_js_dynamic_imports(path, result)
     return result
 
 
@@ -1348,6 +1349,38 @@ def _emit_rescued_import(
     })
     result.setdefault("edges", []).append(edge)
     existing_ids.add(node_id)
+
+
+def _extract_js_dynamic_imports(path: Path, result: dict) -> None:
+    """Recover statically-addressable ``import()`` calls outside callable bodies.
+
+    The AST call walker records imports reached from a named function.  Framework
+    wiring often puts a dynamic import in a top-level callback instead, for
+    example ``const Page = lazy(() => import('./Page'))``.  That callback has no
+    standalone graph node, but its importing module is still unambiguous.  A
+    module-level deferred edge gives subsequent JSX/call resolution the import
+    proof required to connect the router to the lazily loaded component.
+    """
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+        existing_ids = {node["id"] for node in result.get("nodes", [])}
+        aliases = _load_tsconfig_aliases(path.parent)
+        base_url = _load_tsconfig_base_url(path.parent)
+        for match in re.finditer(r"""\bimport\(\s*['\"]([^'\"]+)['\"]\s*\)""", source):
+            raw = match.group(1)
+            if raw:
+                _emit_rescued_import(
+                    result,
+                    existing_ids,
+                    _make_id(str(path)),
+                    path,
+                    raw,
+                    "dynamic_import",
+                    aliases,
+                    base_url,
+                )
+    except OSError:
+        return
 
 
 def extract_svelte(path: Path) -> dict:
@@ -5164,7 +5197,7 @@ def extract(
     for e in all_edges:
         if e.get("relation") == "imports":
             file_to_symbol_imports.setdefault(e["source"], set()).add(e["target"])
-        elif e.get("relation") == "imports_from":
+        elif e.get("relation") in ("imports_from", "dynamic_import"):
             file_to_module_imports.setdefault(e["source"], set()).add(e["target"])
 
     # Map each node back to its containing file node id so we can ask
@@ -5205,6 +5238,10 @@ def extract(
         nid_to_file_nid[n["id"]] = _file_node_id(sf_rel)
 
     existing_pairs = {(e["source"], e["target"]) for e in all_edges}
+    existing_relation_pairs = {
+        (e["source"], e["target"], str(e.get("relation") or "uses"))
+        for e in all_edges
+    }
     # Call-like pairs only, for the indirect_call dedup: an `imports` edge from a
     # file to the symbol it imports is EXPECTED and must not suppress an
     # indirect_call to that same symbol (JS/TS named imports create such an edge).
@@ -5461,7 +5498,15 @@ def extract(
         # (INFERRED, callable-target-gated) and independent of import evidence.
         if not has_import_evidence and str(rc.get("source_file", "")).endswith(_JS_TS_CALL_SUFFIXES):
             continue
-        if tgt != caller and (caller, tgt) not in existing_pairs:
+        resolved_relation = str(rc.get("relation", "calls"))
+        # An import proves availability, not execution/rendering.  Keep the
+        # historic pair-level deduplication for ordinary calls, but allow a
+        # semantically distinct relation such as JSX `renders` to coexist with
+        # an import edge.  This preserves the route/entrypoint chain without
+        # inflating duplicate call edges.
+        is_new_relation = (caller, tgt, resolved_relation) not in existing_relation_pairs
+        if tgt != caller and is_new_relation and (
+                resolved_relation != "calls" or (caller, tgt) not in existing_pairs):
             resolution = "name_guess"
             if rc.get("language") == "go":
                 # Bare calls are valid only inside the same Go package. Cross-
@@ -5473,6 +5518,7 @@ def extract(
                     continue
                 resolution = "same_go_package"
             existing_pairs.add((caller, tgt))
+            existing_relation_pairs.add((caller, tgt, resolved_relation))
             # Promote to EXTRACTED when there's a direct import edge from the
             # caller's file pointing at either the callee symbol itself or the
             # file the callee lives in.
@@ -5488,7 +5534,7 @@ def extract(
             all_edges.append({
                 "source": caller,
                 "target": tgt,
-                "relation": rc.get("relation", "calls"),
+                "relation": resolved_relation,
                 "context": rc.get("context", "call"),
                 "confidence": confidence,
                 "confidence_score": confidence_score,

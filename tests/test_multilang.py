@@ -91,6 +91,46 @@ function MembersView() {
     assert ("MembersView", "ActionState") in _edge_labels(result, "renders", "jsx")
 
 
+def test_tsx_extracts_dynamic_import_from_react_lazy_factory(tmp_path):
+    page = tmp_path / "epic-hierarchy-page.tsx"
+    page.write_text("export function EpicHierarchyPage() { return <main />; }\n", encoding="utf-8")
+    router = tmp_path / "routes.tsx"
+    router.write_text(
+        """import { lazy } from 'react';
+const EpicHierarchyPage = lazy(() => import('./epic-hierarchy-page').then((m) => ({ default: m.EpicHierarchyPage })));
+const protectedRoutes = [{ element: <EpicHierarchyPage /> }];
+export function AppRouter() { return <>{protectedRoutes.map((route) => route.element)}</>; }
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_js(router)
+    dynamic_imports = [edge for edge in result["edges"] if edge["relation"] == "dynamic_import"]
+    assert any(edge.get("target_file") == str(page) for edge in dynamic_imports)
+    assert any(
+        call["caller_nid"].endswith("approuter") and call["callee"] == "EpicHierarchyPage"
+        and call["relation"] == "renders"
+        for call in result["raw_calls"]
+    )
+
+
+def test_tsx_extracts_module_level_react_entrypoint_render(tmp_path):
+    entry = tmp_path / "main.tsx"
+    entry.write_text(
+        """import { AppRouter } from './routes';
+createRoot(document.getElementById('root')).render(<AppRouter />);
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_js(entry)
+    assert any(
+        call["caller_nid"].endswith("main_tsx") and call["callee"] == "AppRouter"
+        and call["relation"] == "renders"
+        for call in result["raw_calls"]
+    )
+
+
 def test_ts_classifies_error_types(tmp_path):
     source = tmp_path / "errors.ts"
     source.write_text(
