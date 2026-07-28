@@ -2397,6 +2397,19 @@ def _extract_generic(
             metadata = None
             if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
                 metadata = {"is_nested_type": True}
+            if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+                metadata = dict(metadata or {})
+                metadata.update({
+                    "language": "typescript" if config.ts_module == "tree_sitter_typescript" else "javascript",
+                    "kind": "class",
+                    "architecture_role": (
+                        "test_support" if path.name.endswith((".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"))
+                        else "error" if class_name.endswith(("Error", "Exception"))
+                        else "contract" if class_name.endswith(("Request", "Response", "Input", "Output", "Params", "Options", "Payload"))
+                        else "value" if class_name.endswith(("Result", "Outcome", "State", "Details", "Info"))
+                        else "runtime_actor"
+                    ),
+                })
             add_node(class_nid, class_name, line, metadata=metadata)
             callable_def_nids.add(class_nid)  # a class is callable (constructor)
             callable_class_nids.add(class_nid)  # ...but only via its constructor (#2137)

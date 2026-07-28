@@ -150,6 +150,7 @@ def extract_go(path: Path) -> dict:
     # before the type declaration that owns them. Pre-scan type kinds so a
     # receiver node receives its semantic kind even in that ordering.
     declared_type_kinds: dict[str, str] = {}
+    error_receiver_types: set[str] = set()
 
     def collect_type_kinds(node) -> None:
         if node.type == "type_declaration":
@@ -165,6 +166,19 @@ def extract_go(path: Path) -> dict:
                 )
                 if type_kind is not None:
                     declared_type_kinds[_read_text(name_node, source)] = type_kind.removesuffix("_type")
+        if node.type == "method_declaration":
+            name_node = node.child_by_field_name("name")
+            receiver = node.child_by_field_name("receiver")
+            if name_node is not None and receiver is not None and _read_text(name_node, source) == "Error":
+                parameter = next(
+                    (child for child in receiver.children if child.type == "parameter_declaration"),
+                    None,
+                )
+                type_node = parameter.child_by_field_name("type") if parameter is not None else None
+                if type_node is not None:
+                    receiver_type = _read_text(type_node, source).lstrip("*").strip()
+                    if receiver_type:
+                        error_receiver_types.add(receiver_type)
         for child in node.children:
             collect_type_kinds(child)
 
@@ -174,10 +188,21 @@ def extract_go(path: Path) -> dict:
         type_kind = declared_type_kinds.get(name)
         if type_kind is None:
             return None
+        if path.name.endswith("_test.go"):
+            architecture_role = "test_support"
+        elif name in error_receiver_types or name.lower().endswith("error"):
+            architecture_role = "error"
+        elif name.endswith(("Request", "Response", "Input", "Output", "Params", "Options", "Payload")):
+            architecture_role = "contract"
+        elif name.endswith(("Result", "Outcome", "State", "Details", "Info")):
+            architecture_role = "value"
+        else:
+            architecture_role = "runtime_actor"
         return {
             "language": "go",
             "kind": type_kind,
             "visibility": "exported" if name and name[0].isupper() else "unexported",
+            "architecture_role": architecture_role,
         }
 
     def ensure_named_node(name: str, line: int) -> str:

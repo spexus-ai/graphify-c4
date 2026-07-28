@@ -91,6 +91,26 @@ function MembersView() {
     assert ("MembersView", "ActionState") in _edge_labels(result, "renders", "jsx")
 
 
+def test_ts_classifies_error_types(tmp_path):
+    source = tmp_path / "errors.ts"
+    source.write_text(
+        """class RequestTimeoutError extends Error {}
+class ApiClient {}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_js(source)
+    roles = {
+        node["label"]: node["metadata"]["architecture_role"]
+        for node in result["nodes"]
+        if node.get("metadata", {}).get("language") == "typescript"
+    }
+
+    assert roles["RequestTimeoutError"] == "error"
+    assert roles["ApiClient"] == "runtime_actor"
+
+
 def test_ts_import_edges_have_import_context():
     r = extract_js(FIXTURES / "sample.ts")
     import_edges = _edges_with_relation(r, "imports", "imports_from")
@@ -146,6 +166,35 @@ func (s *roleService) Create() {}
     assert by_label["RoleService"]["metadata"]["kind"] == "interface"
     assert by_label["roleService"]["metadata"]["kind"] == "struct"
     assert method_edge["source"] == by_label["roleService"]["id"]
+
+
+def test_go_classifies_runtime_contract_value_and_error_types(tmp_path):
+    source = tmp_path / "types.go"
+    source.write_text(
+        """package types
+
+type CreateRequest struct{}
+type HealthOutcome struct{}
+type transportFault struct{}
+type Service struct{}
+
+func (*transportFault) Error() string { return "fault" }
+func (*Service) Run() {}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_go(source)
+    roles = {
+        node["label"]: node["metadata"]["architecture_role"]
+        for node in result["nodes"]
+        if node.get("metadata", {}).get("language") == "go"
+    }
+
+    assert roles["CreateRequest"] == "contract"
+    assert roles["HealthOutcome"] == "value"
+    assert roles["transportFault"] == "error"
+    assert roles["Service"] == "runtime_actor"
 
 def test_go_resolves_typed_local_receiver_and_emits_dto_use(tmp_path):
     source = tmp_path / "requests.go"
