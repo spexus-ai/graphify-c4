@@ -62,6 +62,33 @@ dependencies, for example a frontend container reaching any datastore:
 }
 ```
 
+### Discussion metadata
+
+The Component graph is the default technical starting point for architecture
+discussions. Add optional, reviewed metadata to an element or a
+`component_generator` so the graph explains responsibility as well as
+connectivity:
+
+```json
+{
+  "id": "back.authorization",
+  "c4_type": "component",
+  "parent": "back",
+  "name": "AuthorizationService",
+  "responsibility": "Decide scoped permissions",
+  "owner": "Identity team",
+  "trust_boundary": "Authenticated tenant and project scope",
+  "data_access": ["role bindings", "memberships"],
+  "public_contracts": ["CheckScopedPermission"],
+  "criticality": "high"
+}
+```
+
+`responsibility`, `owner`, `trust_boundary`, and `criticality` are non-empty
+strings; `data_access` and `public_contracts` are lists of non-empty strings.
+Generator metadata is copied to every generated component. It is deliberately
+descriptive rather than inferred: a team reviews it as part of its C4 contract.
+
 ### Concrete implementation components
 
 A folder is often a useful *container boundary*, but it is usually too broad
@@ -184,10 +211,12 @@ Context, Container, Component, and Code navigation.
   generated `code:<graph-node-id>` children of their component; the contract
   itself remains compact and declares only architectural boundaries.
 - `html` writes `graphify-out/architecture.html`, an interactive C4 view using
-  the same vis-network renderer as Graphify's `graph.html`: force-directed
-  layout, drag, zoom, search, node inspection and filter-out checkboxes for
-  the currently visible nodes. Declared relations are solid green arrows;
-  code-derived evidence is orange and dashed.
+  the same vis-network renderer as Graphify's `graph.html`. It opens on the
+  complete Component graph. `Highlight` emphasizes a selected component or
+  boundary and its direct relationships without removing the rest of the
+  system; the node inspector shows the discussion metadata above. Declared
+  relations are solid green arrows; code-derived evidence is orange and
+  dashed.
 - `up <node>` maps a code node to its component, container, and system.
 - `down <element> --to code` returns the implementing graph node IDs.
 - `impact <node-or-file>` performs a reverse dependency walk and returns the
@@ -203,6 +232,23 @@ Every observed relationship in `architecture.json` retains the code node IDs,
 source file, source location, resolution provenance, and
 `EXTRACTED`/`INFERRED` confidence. Only reviewed rules backed by `EXTRACTED`
 evidence with trustworthy resolution should fail CI.
+
+## Architecture discussion protocol
+
+For a technical architecture question, start with the complete Component graph,
+then use `up`, `down`, `impact`, and edge evidence to confirm the relevant
+claims. Do not create a separate, isolated topic graph: highlighting is a
+navigation aid, not a filter for architectural context. Before proposing a
+change, report:
+
+1. **Graph facts** — observed and declared relationships, with evidence.
+2. **Uncertainties** — unmapped, ambiguous, or suspect edges.
+3. **Decision** — the boundary or dependency rule being proposed.
+4. **Full-graph impact** — components, relations, and C4 rules that change.
+
+Start at Context only for actor/external-system questions, and at Container for
+cross-runtime or deployment questions. Move to Components before making a
+technical design conclusion.
 
 ## Historical diff
 

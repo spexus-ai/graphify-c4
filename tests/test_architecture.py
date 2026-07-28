@@ -156,6 +156,48 @@ def test_component_generator_can_require_symbol_metadata_and_a_structural_relati
     assert "contract" not in projection["mappings"]
 
 
+def test_component_metadata_is_validated_and_propagated_from_generators():
+    model = {
+        "schema": "graphify.architecture/v1",
+        "scope": {"include": ["src/**"]},
+        "elements": [
+            {"id": "system", "c4_type": "software_system", "name": "System"},
+            {"id": "api", "c4_type": "container", "parent": "system", "name": "API"},
+        ],
+        "component_generators": [{
+            "id_prefix": "api.service",
+            "parent": "api",
+            "selector": {"metadata": {"language": "go", "kind": "struct"}},
+            "responsibility": "Apply business policy",
+            "owner": "Core team",
+            "trust_boundary": "Authenticated request",
+            "data_access": ["project data"],
+            "public_contracts": ["Service API"],
+            "criticality": "high",
+        }],
+        "relations": [], "rules": [],
+    }
+    graph = {
+        "nodes": [{
+            "id": "implementation", "label": "roleService", "file_type": "code", "source_file": "src/role.go",
+            "metadata": {"language": "go", "kind": "struct"},
+        }],
+        "links": [],
+    }
+
+    assert validate_model(model) == []
+    projection = build_projection(model, graph)
+    generated = next(item for item in projection["elements"] if item["id"] == "api.service.implementation")
+    assert generated["responsibility"] == "Apply business policy"
+    assert generated["data_access"] == ["project data"]
+    assert generated["public_contracts"] == ["Service API"]
+
+    invalid = {**model, "elements": [{
+        "id": "system", "c4_type": "software_system", "name": "System", "owner": ["not a string"],
+    }]}
+    assert "element 'system' owner must be a non-empty string" in validate_model(invalid)
+
+
 def test_projection_rolls_code_relationships_to_c4_and_retains_evidence():
     projection = build_projection(MODEL, GRAPH)
 
@@ -414,6 +456,13 @@ def test_architecture_html_cli_writes_interactive_c4_view(monkeypatch, tmp_path,
     assert "packagePath" in html
     assert "cross-package bridges" in html
     assert "go_import_type" in html
+    assert '<option value="component" selected>Component</option>' in html
+    assert "Highlight keeps the complete graph visible" in html
+    assert "function focusTargets(elements)" in html
+    assert "function updateHighlightState(elements, relations)" in html
+    assert "maxComponentNodes = Number.POSITIVE_INFINITY" in html
+    assert "return payload.elements.filter(item => wanted.has(item.c4_type));" in html
+    assert "Responsibility" in html
     assert "maxFocusedCodeNodes = 750" in html
     assert "growConnected" in html
     assert "function focusNode(id, scale=1.55)" in html

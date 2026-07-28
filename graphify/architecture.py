@@ -38,6 +38,9 @@ LEVEL_TYPES = {
     "code": {"code"},
 }
 TRUSTED_RESOLUTIONS = frozenset({"same_file", "same_go_package", "go_import", "go_import_type"})
+ARCHITECTURE_TEXT_FIELDS = ("responsibility", "owner", "trust_boundary", "criticality")
+ARCHITECTURE_LIST_FIELDS = ("data_access", "public_contracts")
+ARCHITECTURE_METADATA_FIELDS = ARCHITECTURE_TEXT_FIELDS + ARCHITECTURE_LIST_FIELDS
 
 
 def default_model() -> dict[str, Any]:
@@ -119,6 +122,19 @@ def load_model(path: Path) -> dict[str, Any]:
     return data
 
 
+def _validate_architecture_metadata(item: dict[str, Any], label: str, errors: list[str]) -> None:
+    """Validate optional discussion metadata carried by C4 elements and generators."""
+    for field in ARCHITECTURE_TEXT_FIELDS:
+        if field in item and (not isinstance(item[field], str) or not item[field].strip()):
+            errors.append(f"{label} {field} must be a non-empty string")
+    for field in ARCHITECTURE_LIST_FIELDS:
+        if field not in item:
+            continue
+        value = item[field]
+        if not isinstance(value, list) or any(not isinstance(entry, str) or not entry.strip() for entry in value):
+            errors.append(f"{label} {field} must be a list of non-empty strings")
+
+
 def validate_model(model: object) -> list[str]:
     """Validate the declarative C4 model without depending on a graph build."""
     if not isinstance(model, dict):
@@ -149,6 +165,7 @@ def validate_model(model: object) -> list[str]:
             errors.append(f"element '{element_id}' has invalid c4_type '{element.get('c4_type')}'")
         if not isinstance(element.get("name"), str) or not element["name"].strip():
             errors.append(f"element '{element_id}' needs a non-empty name")
+        _validate_architecture_metadata(element, f"element '{element_id}'", errors)
         implementation = element.get("implementation", [])
         if not isinstance(implementation, list):
             errors.append(f"element '{element_id}' implementation must be a list")
@@ -230,6 +247,7 @@ def validate_model(model: object) -> list[str]:
             errors.append(f"component generator {index} layer must be a non-empty string")
         if "visual" in generator and not isinstance(generator["visual"], dict):
             errors.append(f"component generator {index} visual must be an object")
+        _validate_architecture_metadata(generator, f"component generator {index}", errors)
 
     for element_id in by_id:
         current: str | None = element_id
@@ -481,6 +499,9 @@ def _generated_components(
                 element["layer"] = generator["layer"]
             if isinstance(generator.get("visual"), dict):
                 element["visual"] = dict(generator["visual"])
+            for field in ARCHITECTURE_METADATA_FIELDS:
+                if field in generator:
+                    element[field] = list(generator[field]) if field in ARCHITECTURE_LIST_FIELDS else generator[field]
             elements.append(element)
             source_file = _normalise_path(node.get("source_file"))
             if generator.get("ownership", "file_if_unique") == "file_if_unique" and len(roots_by_file[source_file]) == 1:
