@@ -61,13 +61,15 @@ def default_model() -> dict[str, Any]:
 def default_workspace_model(
     repositories: list[dict[str, str]], system_name: str = "System",
 ) -> dict[str, Any]:
-    """Create a portable C4 starter with one refinable component per repository.
+    """Create a portable C4 starter with concrete-symbol component discovery.
 
     Graphify extracts Java, Kotlin, TypeScript/React, Android and other supported
     languages into the same fact schema, so the workspace layer intentionally
     describes repositories and paths rather than technology-specific build tools.
-    Teams replace the broad ``implementation`` components with their own module
-    boundaries as the C4 contract matures.
+    The initial component generator deliberately creates no folder-shaped
+    component.  It lets a team select its meaningful implementation roots
+    (handlers, classes, React components, adapters) after review instead of
+    treating a package as an architectural component.
     """
     elements: list[dict[str, Any]] = [{
         "id": "system",
@@ -88,14 +90,6 @@ def default_workspace_model(
                 "name": repository_id,
                 "description": f"Repository at {repository_path}",
             },
-            {
-                "id": f"component.{repository_id}.implementation",
-                "c4_type": "component",
-                "parent": container_id,
-                "name": f"{repository_id} implementation",
-                "description": "Starter component; split it into architectural modules after review.",
-                "implementation": [{"path_prefix": repository_path}],
-            },
         ))
         includes.append(f"{repository_path}/**")
     return {
@@ -106,6 +100,7 @@ def default_workspace_model(
             "exclude": ["**/graphify-out/**", "**/node_modules/**"],
         },
         "elements": elements,
+        "component_generators": [],
         "relations": [],
         "rules": [],
     }
@@ -161,11 +156,21 @@ def validate_model(model: object) -> list[str]:
             for selector_index, selector in enumerate(implementation):
                 if not isinstance(selector, dict):
                     errors.append(f"element '{element_id}' implementation {selector_index} must be an object")
-                elif not any(key in selector for key in ("path_prefix", "source_file", "node_id", "label")):
+                elif not any(
+                    key in selector
+                    for key in ("path_prefix", "path_glob", "source_file", "node_id", "label", "label_regex")
+                ):
                     errors.append(
                         f"element '{element_id}' implementation {selector_index} needs "
-                        "path_prefix, source_file, node_id, or label"
+                        "path_prefix, path_glob, source_file, node_id, label, or label_regex"
                     )
+                elif "label_regex" in selector:
+                    try:
+                        re.compile(str(selector["label_regex"]))
+                    except re.error as exc:
+                        errors.append(
+                            f"element '{element_id}' implementation {selector_index} has invalid label_regex: {exc}"
+                        )
 
     for element_id, element in by_id.items():
         parent = element.get("parent")
@@ -173,6 +178,41 @@ def validate_model(model: object) -> list[str]:
             errors.append(f"element '{element_id}' parent '{parent}' does not exist")
         if parent == element_id:
             errors.append(f"element '{element_id}' cannot be its own parent")
+
+    generators = model.get("component_generators", [])
+    if not isinstance(generators, list):
+        errors.append("component_generators must be a list")
+        generators = []
+    for index, generator in enumerate(generators):
+        if not isinstance(generator, dict):
+            errors.append(f"component generator {index} must be an object")
+            continue
+        prefix = generator.get("id_prefix")
+        if not isinstance(prefix, str) or not prefix.strip():
+            errors.append(f"component generator {index} needs a non-empty id_prefix")
+        parent = generator.get("parent")
+        if not isinstance(parent, str) or parent not in by_id:
+            errors.append(f"component generator {index} parent must reference an element")
+        elif by_id[parent].get("c4_type") != "container":
+            errors.append(f"component generator {index} parent must be a container")
+        selector = generator.get("selector")
+        if not isinstance(selector, dict):
+            errors.append(f"component generator {index} needs a selector object")
+        elif not any(
+            key in selector
+            for key in ("path_prefix", "path_glob", "source_file", "node_id", "label", "label_regex")
+        ):
+            errors.append(f"component generator {index} selector needs a node, path, or label matcher")
+        elif "label_regex" in selector:
+            try:
+                re.compile(str(selector["label_regex"]))
+            except re.error as exc:
+                errors.append(f"component generator {index} has invalid label_regex: {exc}")
+        ownership = generator.get("ownership", "file_if_unique")
+        if ownership not in {"file_if_unique", "structural"}:
+            errors.append(
+                f"component generator {index} ownership must be 'file_if_unique' or 'structural'"
+            )
 
     for element_id in by_id:
         current: str | None = element_id
@@ -281,7 +321,13 @@ def _matches_selector(node_id: str, node: dict[str, Any], selector: dict[str, An
         prefix = _normalise_path(selector["path_prefix"]).rstrip("/")
         if not (source_file == prefix or source_file.startswith(prefix + "/")):
             return False
+    if "path_glob" in selector and not fnmatch(source_file, _normalise_path(selector["path_glob"])):
+        return False
     if "label" in selector and str(node.get("label", "")) != str(selector["label"]):
+        return False
+    if "label_regex" in selector and re.fullmatch(
+        str(selector["label_regex"]), str(node.get("label", ""))
+    ) is None:
         return False
     return True
 
@@ -319,10 +365,101 @@ def _code_element_id(node_id: str) -> str:
     return f"code:{node_id}"
 
 
+def _generated_component_id(prefix: str, node_id: str) -> str:
+    """Make a portable C4 ID from a graph node without losing its stability."""
+    suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", node_id).strip("-.") or "symbol"
+    return f"{prefix.rstrip('.')}.{suffix}"
+
+
+def _structural_members(root: str, links: list[dict[str, Any]]) -> set[str]:
+    """Return a symbol and its structural children, never its call dependencies."""
+    children: dict[str, set[str]] = defaultdict(set)
+    for link in links:
+        if str(link.get("relation") or "") not in {"contains", "method"}:
+            continue
+        source = str(link.get("_src") or link.get("source") or "")
+        target = str(link.get("_tgt") or link.get("target") or "")
+        if source and target:
+            children[source].add(target)
+    members = {root}
+    queue = deque([root])
+    while queue:
+        current = queue.popleft()
+        for child in sorted(children.get(current, ())):
+            if child not in members:
+                members.add(child)
+                queue.append(child)
+    return members
+
+
+def _generated_components(
+    model: dict[str, Any], scoped_nodes: dict[str, dict[str, Any]], graph: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    """Materialize C4 components from concrete source symbols.
+
+    A generator deliberately selects *symbols*, not folders.  ``file_if_unique``
+    assigns a complete source file to its sole selected root (the normal Go,
+    Java, Kotlin and React convention); ``structural`` assigns only the root and
+    members proven by ``contains``/``method`` edges.  Generated ownership
+    overrides broad declared folder selectors, while competing generators remain
+    an explicit ambiguous mapping.
+    """
+    elements: list[dict[str, Any]] = []
+    ownership: dict[str, list[str]] = defaultdict(list)
+    production_nodes = {
+        node_id: node for node_id, node in scoped_nodes.items() if node.get("file_type") == "code"
+    }
+    for generator in model.get("component_generators", []):
+        if not isinstance(generator, dict):
+            continue
+        selector = generator.get("selector", {})
+        if not isinstance(selector, dict):
+            continue
+        roots = [
+            node_id for node_id, node in sorted(production_nodes.items())
+            if _matches_selector(node_id, node, selector)
+        ]
+        roots_by_file: dict[str, list[str]] = defaultdict(list)
+        for root in roots:
+            roots_by_file[_normalise_path(production_nodes[root].get("source_file"))].append(root)
+        for root in roots:
+            node = production_nodes[root]
+            component_id = _generated_component_id(str(generator["id_prefix"]), root)
+            name = str(generator.get("name_template", "{label}")).format(
+                label=str(node.get("label") or root),
+                node_id=root,
+                source_file=_normalise_path(node.get("source_file")),
+            )
+            element = {
+                "id": component_id,
+                "c4_type": "component",
+                "parent": generator["parent"],
+                "name": name,
+                "source": "generated",
+                "graph_node_id": root,
+                "source_file": _normalise_path(node.get("source_file")),
+            }
+            if isinstance(generator.get("description_template"), str):
+                element["description"] = generator["description_template"].format(
+                    label=str(node.get("label") or root), node_id=root,
+                    source_file=_normalise_path(node.get("source_file")),
+                )
+            elements.append(element)
+            source_file = _normalise_path(node.get("source_file"))
+            if generator.get("ownership", "file_if_unique") == "file_if_unique" and len(roots_by_file[source_file]) == 1:
+                members = {
+                    node_id for node_id, candidate in production_nodes.items()
+                    if _normalise_path(candidate.get("source_file")) == source_file
+                }
+            else:
+                members = _structural_members(root, _links(graph)) & set(production_nodes)
+            for member in members:
+                ownership[member].append(component_id)
+    return elements, ownership
+
+
 def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
     """Map observed graph nodes and relationships onto a declared C4 model."""
-    elements_list = model["elements"]
-    elements = {element["id"]: element for element in elements_list}
     scoped_nodes = {
         str(node["id"]): node
         for node in graph.get("nodes", [])
@@ -330,6 +467,9 @@ def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, 
         and isinstance(node.get("id"), str)
         and _in_scope(_normalise_path(node.get("source_file")), model.get("scope", {}))
     }
+    generated_elements, generated_ownership = _generated_components(model, scoped_nodes, graph)
+    elements_list = model["elements"] + generated_elements
+    elements = {element["id"]: element for element in elements_list}
     mappings: dict[str, list[str]] = defaultdict(list)
     for element in elements_list:
         for selector in element.get("implementation", []):
@@ -338,6 +478,12 @@ def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, 
             for node_id, node in scoped_nodes.items():
                 if _matches_selector(node_id, node, selector) and element["id"] not in mappings[node_id]:
                     mappings[node_id].append(element["id"])
+
+    # A concrete root is more precise than a legacy folder/package selector.
+    # Do retain collisions between two concrete roots: this is a real modelling
+    # ambiguity that needs an explicit selector refinement.
+    for node_id, owners in generated_ownership.items():
+        mappings[node_id] = sorted(set(owners))
 
     ambiguous = [node_id for node_id, mapped in mappings.items() if len(mapped) > 1]
     mapped_nodes = {node_id for node_id, mapped in mappings.items() if len(mapped) == 1}

@@ -26,7 +26,8 @@ boundaries before treating it as an architectural source of truth.
 
 The model uses the schema `graphify.architecture/v1`. Elements have stable IDs,
 a C4 type, optional parent, and optional implementation selectors. Supported
-selectors are `path_prefix`, `source_file`, `node_id`, and `label`.
+selectors are `path_prefix`, `path_glob`, `source_file`, `node_id`, `label`, and
+`label_regex`.
 
 ```json
 {
@@ -61,6 +62,37 @@ dependencies, for example a frontend container reaching any datastore:
 }
 ```
 
+### Concrete implementation components
+
+A folder is often a useful *container boundary*, but it is usually too broad
+to be a C4 Component. `component_generators` create a component per selected
+source symbol: a Go handler/struct, a Java or Kotlin class, or a React
+component. The generated component owns either its complete source file when
+it is the sole selected root, or just its proven `contains`/`method` members.
+That makes a component-level diff about implementations such as `RoleHandler`,
+not `internal/handlers`.
+
+```json
+{
+  "component_generators": [{
+    "id_prefix": "back.handler",
+    "parent": "container.back",
+    "name_template": "{label}",
+    "selector": {
+      "path_prefix": "back/internal/handlers",
+      "label_regex": "^[A-Z][A-Za-z0-9]*Handler$"
+    },
+    "ownership": "file_if_unique"
+  }]
+}
+```
+
+`file_if_unique` is the default and follows the normal one-primary-type-per-file
+convention. Use `structural` for files containing several selected classes: the
+component then owns only the root and direct structural members. Generated roots
+take precedence over a broad folder selector; two generated roots claiming the
+same code are reported as an ambiguous mapping instead of silently choosing one.
+
 ## Multi-repository workspace
 
 A workspace model is the same C4 contract with an additional `repositories`
@@ -80,9 +112,10 @@ graphify architecture workspace init \
 ```
 
 This writes `architecture/graphify.workspace.c4.json` without overwriting an
-existing model. The starter gives each repository a container and one broad
-implementation component, so all four levels are navigable immediately.
-Replace those broad components with real modules after architectural review.
+existing model. The starter gives each repository a container but intentionally
+does not invent a folder-shaped component. Add `component_generators` for the
+real implementation roots after architectural review; this avoids a misleading
+Component view in a new Java/Kotlin/React workspace.
 
 Build one local fact graph per repository before composition. For a source-only
 first pass this has no LLM dependency:

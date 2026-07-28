@@ -76,6 +76,46 @@ def test_model_validation_rejects_parent_cycles_and_wrong_collection_types():
     assert "rules must be a list" in errors
 
 
+def test_component_generator_creates_symbol_components_and_overrides_folder_mapping():
+    model = {
+        "schema": "graphify.architecture/v1",
+        "scope": {"include": ["src/**"]},
+        "elements": [
+            {"id": "system", "c4_type": "software_system", "name": "System"},
+            {"id": "api", "c4_type": "container", "parent": "system", "name": "API"},
+            {"id": "legacy.handlers", "c4_type": "component", "parent": "api", "name": "Handlers",
+             "implementation": [{"path_prefix": "src/handlers"}]},
+        ],
+        "component_generators": [{
+            "id_prefix": "api.handler",
+            "parent": "api",
+            "selector": {"path_prefix": "src/handlers", "label_regex": "^[A-Z][A-Za-z0-9]*Handler$"},
+            "ownership": "file_if_unique",
+        }],
+        "relations": [], "rules": [],
+    }
+    graph = {
+        "nodes": [
+            {"id": "role", "label": "RoleHandler", "file_type": "code", "source_file": "src/handlers/role.go"},
+            {"id": "create", "label": ".Create()", "file_type": "code", "source_file": "src/handlers/role.go"},
+            {"id": "constructor", "label": "NewRoleHandler()", "file_type": "code", "source_file": "src/handlers/role.go"},
+            {"id": "other", "label": "Other", "file_type": "code", "source_file": "src/handlers/other.go"},
+        ],
+        "links": [{"source": "role", "target": "create", "relation": "method"}],
+    }
+
+    assert validate_model(model) == []
+    projection = build_projection(model, graph)
+
+    component_id = "api.handler.role"
+    assert any(item["id"] == component_id and item["name"] == "RoleHandler" for item in projection["elements"])
+    assert projection["mappings"]["role"] == [component_id]
+    assert projection["mappings"]["create"] == [component_id]
+    assert projection["mappings"]["constructor"] == [component_id]
+    assert projection["mappings"]["other"] == ["legacy.handlers"]
+    assert projection["ambiguous_code_nodes"] == []
+
+
 def test_projection_rolls_code_relationships_to_c4_and_retains_evidence():
     projection = build_projection(MODEL, GRAPH)
 
@@ -460,8 +500,7 @@ def test_workspace_init_creates_portable_language_neutral_starter(monkeypatch, t
         {"id": "android-app", "path": "mobile/android"},
     ]
     assert model["scope"]["include"] == ["web/**", "services/api/**", "mobile/android/**"]
-    assert {item["id"] for item in model["elements"]} >= {
-        "system", "container.web", "component.web.implementation",
-        "container.api", "component.api.implementation",
-        "container.android-app", "component.android-app.implementation",
+    assert {item["id"] for item in model["elements"]} == {
+        "system", "container.web", "container.api", "container.android-app",
     }
+    assert model["component_generators"] == []
