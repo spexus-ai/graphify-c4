@@ -4652,6 +4652,7 @@ def extract(
     all_raw_calls: list[dict] = []
     all_raw_type_refs: list[dict] = []
     all_raw_registrations: list[dict] = []
+    all_raw_factory_injections: list[dict] = []
     # Extractors retain a convenient basename in ``source_file``.  Keep the
     # project-relative directory separately while aggregating: Go package
     # imports are directory-addressed and two ``service.go`` files can coexist.
@@ -4662,6 +4663,7 @@ def extract(
         all_raw_calls.extend(result.get("raw_calls", []))
         all_raw_type_refs.extend(result.get("raw_type_refs", []))
         all_raw_registrations.extend(result.get("raw_registrations", []))
+        all_raw_factory_injections.extend(result.get("raw_factory_injections", []))
         try:
             relative_dir = source_path.resolve().relative_to(root.resolve()).parent.as_posix()
         except (OSError, RuntimeError, ValueError):
@@ -5523,7 +5525,11 @@ def extract(
         for edge in all_edges
     }
     for registration in all_raw_registrations:
-        if not isinstance(registration, dict) or registration.get("language") != "go":
+        if (
+            not isinstance(registration, dict)
+            or registration.get("language") != "go"
+            or str(registration.get("source_file", "")).endswith("_test.go")
+        ):
             continue
         registry_factory = _go_local_factory(
             registration.get("registry_factory"), registration.get("source_file", "")
@@ -5553,6 +5559,44 @@ def extract(
             "resolution": "go_registration_factory",
             "source_file": registration.get("source_file", ""),
             "source_location": registration.get("source_location"),
+            "weight": 1.0,
+        })
+
+    for injection in all_raw_factory_injections:
+        if (
+            not isinstance(injection, dict)
+            or injection.get("language") != "go"
+            or str(injection.get("source_file", "")).endswith("_test.go")
+        ):
+            continue
+        consumer_factory = _go_local_factory(
+            injection.get("consumer_factory"), injection.get("source_file", "")
+        )
+        dependency_factory = _go_local_factory(
+            injection.get("dependency_factory"), injection.get("source_file", "")
+        )
+        if consumer_factory is None or dependency_factory is None:
+            continue
+        consumer_types = factory_constructs.get(consumer_factory, set())
+        dependency_types = factory_constructs.get(dependency_factory, set())
+        if len(consumer_types) != 1 or len(dependency_types) != 1:
+            continue
+        consumer_type = next(iter(consumer_types))
+        dependency_type = next(iter(dependency_types))
+        triplet = (consumer_type, dependency_type, "uses")
+        if consumer_type == dependency_type or triplet in existing_relation_triplets:
+            continue
+        existing_relation_triplets.add(triplet)
+        all_edges.append({
+            "source": consumer_type,
+            "target": dependency_type,
+            "relation": "uses",
+            "context": "factory_injection",
+            "confidence": "EXTRACTED",
+            "confidence_score": 1.0,
+            "resolution": "go_factory_injection",
+            "source_file": injection.get("source_file", ""),
+            "source_location": injection.get("source_location"),
             "weight": 1.0,
         })
 

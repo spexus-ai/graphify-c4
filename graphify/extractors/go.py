@@ -99,6 +99,7 @@ def extract_go(path: Path) -> dict:
     # product.  Keep this small structural trace for the corpus pass, where both
     # factory return types can be resolved across files in the Go package.
     raw_registrations: list[dict] = []
+    raw_factory_injections: list[dict] = []
     # A method name is not unique in Go: two receiver types may both expose
     # Validate().  Calls are resolved after declarations have been collected,
     # keyed by the receiver's static type rather than the bare method name.
@@ -586,6 +587,27 @@ def extract_go(path: Path) -> dict:
             elif node.type == "call_expression":
                 function = node.child_by_field_name("function")
                 arguments = node.child_by_field_name("arguments")
+                # Passing a local product of one ``New…`` factory to another
+                # factory is direct dependency-injection evidence.  The corpus
+                # pass resolves the two concrete factory returns before adding
+                # a dependency edge, so an interface-typed argument is safe.
+                consumer_factory = direct_factory_name(node)
+                if consumer_factory:
+                    for argument_index, argument in enumerate(expression_list_items(arguments)):
+                        if argument.type != "identifier":
+                            continue
+                        dependency_factory = local_factories.get(_read_text(argument, source))
+                        if dependency_factory is None or dependency_factory[1] >= node.start_point[0] + 1:
+                            continue
+                        raw_factory_injections.append({
+                            "caller_nid": caller_nid,
+                            "consumer_factory": consumer_factory,
+                            "dependency_factory": dependency_factory[0],
+                            "argument_index": argument_index,
+                            "language": "go",
+                            "source_file": str_path,
+                            "source_location": f"L{node.start_point[0] + 1}",
+                        })
                 if function is not None and function.type == "selector_expression":
                     field = function.child_by_field_name("field")
                     receiver = function.child_by_field_name("operand")
@@ -720,4 +742,5 @@ def extract_go(path: Path) -> dict:
         "raw_calls": raw_calls,
         "raw_type_refs": raw_type_refs,
         "raw_registrations": raw_registrations,
+        "raw_factory_injections": raw_factory_injections,
     }

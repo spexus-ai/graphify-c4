@@ -254,6 +254,8 @@ func (*RegistryImpl) Register(Provider) {}
 
 type ProviderImpl struct{}
 func NewProvider() Provider { return &ProviderImpl{} }
+type ServiceImpl struct{}
+func NewService(Registry) *ServiceImpl { return &ServiceImpl{} }
 """,
         encoding="utf-8",
     )
@@ -264,6 +266,7 @@ func Setup() {
     registry := NewRegistry()
     provider := NewProvider()
     registry.Register(provider)
+    _ = NewService(registry)
 }
 """,
         encoding="utf-8",
@@ -280,6 +283,12 @@ func Setup() {
     }
 
     assert ("RegistryImpl", "ProviderImpl") in registrations
+    injections = {
+        (labels.get(edge["source"]), labels.get(edge["target"]))
+        for edge in result["edges"]
+        if edge["relation"] == "uses" and edge.get("context") == "factory_injection"
+    }
+    assert ("ServiceImpl", "RegistryImpl") in injections
 
 def test_go_finds_constructor():
     r = extract_go(FIXTURES / "sample.go")
