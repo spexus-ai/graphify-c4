@@ -4653,6 +4653,7 @@ def extract(
     all_raw_type_refs: list[dict] = []
     all_raw_registrations: list[dict] = []
     all_raw_factory_injections: list[dict] = []
+    all_raw_factory_returns: list[dict] = []
     # Extractors retain a convenient basename in ``source_file``.  Keep the
     # project-relative directory separately while aggregating: Go package
     # imports are directory-addressed and two ``service.go`` files can coexist.
@@ -4664,6 +4665,7 @@ def extract(
         all_raw_type_refs.extend(result.get("raw_type_refs", []))
         all_raw_registrations.extend(result.get("raw_registrations", []))
         all_raw_factory_injections.extend(result.get("raw_factory_injections", []))
+        all_raw_factory_returns.extend(result.get("raw_factory_returns", []))
         try:
             relative_dir = source_path.resolve().relative_to(root.resolve()).parent.as_posix()
         except (OSError, RuntimeError, ValueError):
@@ -5520,6 +5522,67 @@ def extract(
         ]
         return candidates[0] if len(candidates) == 1 else None
 
+    def _go_factory(factory_name: object, source_file: object, import_path: object = "") -> str | None:
+        import_value = str(import_path or "")
+        if not import_value:
+            return _go_local_factory(factory_name, source_file)
+        if not go_module_path or not import_value.startswith(go_module_path + "/"):
+            return None
+        package_dir = import_value[len(go_module_path) + 1:].rstrip("/")
+        candidates = [
+            candidate for candidate in global_label_to_nids.get(str(factory_name), [])
+            if candidate in go_callable_nids
+            and (nid_to_project_dir.get(candidate) or _go_source_dir(nid_to_source_file.get(candidate, "")))
+            == package_dir
+            and not str(nid_to_source_file.get(candidate, "")).endswith("_test.go")
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    # Composition wrappers such as ``SetupResourceService…`` often return a
+    # local product of a ``New…`` factory.  Propagate only that explicit return
+    # value; this keeps the concrete type traceable when the wrapper exposes an
+    # interface and is passed onward into a handler factory.
+    for _ in range(4):
+        progressed = False
+        for factory_return in all_raw_factory_returns:
+            if (
+                not isinstance(factory_return, dict)
+                or factory_return.get("language") != "go"
+                or str(factory_return.get("source_file", "")).endswith("_test.go")
+            ):
+                continue
+            wrapper = _go_factory(
+                factory_return.get("factory"), factory_return.get("source_file", "")
+            )
+            delegated = _go_factory(
+                factory_return.get("delegated_factory"), factory_return.get("source_file", ""),
+                factory_return.get("delegated_import_path", ""),
+            )
+            if wrapper is None or delegated is None:
+                continue
+            returned_types = factory_constructs.get(delegated, set())
+            if len(returned_types) != 1:
+                continue
+            returned_type = next(iter(returned_types))
+            if returned_type in factory_constructs.get(wrapper, set()):
+                continue
+            factory_constructs.setdefault(wrapper, set()).add(returned_type)
+            all_edges.append({
+                "source": wrapper,
+                "target": returned_type,
+                "relation": "constructs",
+                "context": "factory_delegation",
+                "confidence": "EXTRACTED",
+                "confidence_score": 1.0,
+                "resolution": "go_factory_return",
+                "source_file": factory_return.get("source_file", ""),
+                "source_location": factory_return.get("source_location"),
+                "weight": 1.0,
+            })
+            progressed = True
+        if not progressed:
+            break
+
     existing_relation_triplets = {
         (str(edge.get("source", "")), str(edge.get("target", "")), str(edge.get("relation", "")))
         for edge in all_edges
@@ -5531,11 +5594,13 @@ def extract(
             or str(registration.get("source_file", "")).endswith("_test.go")
         ):
             continue
-        registry_factory = _go_local_factory(
-            registration.get("registry_factory"), registration.get("source_file", "")
+        registry_factory = _go_factory(
+            registration.get("registry_factory"), registration.get("source_file", ""),
+            registration.get("registry_import_path", ""),
         )
-        provider_factory = _go_local_factory(
-            registration.get("registered_factory"), registration.get("source_file", "")
+        provider_factory = _go_factory(
+            registration.get("registered_factory"), registration.get("source_file", ""),
+            registration.get("registered_import_path", ""),
         )
         if registry_factory is None or provider_factory is None:
             continue
@@ -5569,11 +5634,13 @@ def extract(
             or str(injection.get("source_file", "")).endswith("_test.go")
         ):
             continue
-        consumer_factory = _go_local_factory(
-            injection.get("consumer_factory"), injection.get("source_file", "")
+        consumer_factory = _go_factory(
+            injection.get("consumer_factory"), injection.get("source_file", ""),
+            injection.get("consumer_import_path", ""),
         )
-        dependency_factory = _go_local_factory(
-            injection.get("dependency_factory"), injection.get("source_file", "")
+        dependency_factory = _go_factory(
+            injection.get("dependency_factory"), injection.get("source_file", ""),
+            injection.get("dependency_import_path", ""),
         )
         if consumer_factory is None or dependency_factory is None:
             continue

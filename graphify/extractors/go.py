@@ -91,7 +91,7 @@ def extract_go(path: Path) -> dict:
     nodes: list[dict] = []
     edges: list[dict] = []
     seen_ids: set[str] = set()
-    function_bodies: list[tuple[str, object]] = []
+    function_bodies: list[tuple[str, object, str]] = []
     go_imported_pkgs: dict[str, str] = {}  # local package name/alias -> import path
     raw_type_refs: list[dict] = []
     # A dependency-injection setup often constructs an implementation through a
@@ -100,6 +100,7 @@ def extract_go(path: Path) -> dict:
     # factory return types can be resolved across files in the Go package.
     raw_registrations: list[dict] = []
     raw_factory_injections: list[dict] = []
+    raw_factory_returns: list[dict] = []
     # A method name is not unique in Go: two receiver types may both expose
     # Validate().  Calls are resolved after declarations have been collected,
     # keyed by the receiver's static type rather than the bare method name.
@@ -312,7 +313,7 @@ def extract_go(path: Path) -> dict:
         implementation.  This is deliberately limited to direct composite
         literal returns; forwarding/wrapping factories remain unresolved.
         """
-        if not func_name.startswith("New"):
+        if not func_name.startswith(("New", "Setup")):
             return
 
         def visit(candidate) -> None:
@@ -358,7 +359,7 @@ def extract_go(path: Path) -> dict:
                 emit_factory_construction_edge(node, func_nid, func_name)
                 body = node.child_by_field_name("body")
                 if body:
-                    function_bodies.append((func_nid, body))
+                    function_bodies.append((func_nid, body, func_name))
             return
 
         if t == "method_declaration":
@@ -392,7 +393,7 @@ def extract_go(path: Path) -> dict:
             emit_go_method_refs(node, method_nid, line)
             body = node.child_by_field_name("body")
             if body:
-                function_bodies.append((method_nid, body))
+                function_bodies.append((method_nid, body, method_name))
             return
 
         if t == "type_declaration":
@@ -549,26 +550,48 @@ def extract_go(path: Path) -> dict:
             )
         return local_types
 
-    def emit_factory_registration_trace(caller_nid: str, body_node) -> None:
+    def emit_factory_registration_trace(caller_nid: str, body_node, caller_name: str) -> None:
         """Record proven Go factory-to-registry wiring for the corpus resolver.
 
         Only a direct ``name := NewFactory(...)`` binding followed by
         ``registry.Register…(name)`` qualifies.  This avoids guessing from
         interface conformance or a matching type name.
         """
-        local_factories: dict[str, tuple[str, int]] = {}
+        local_factories: dict[str, tuple[str, int, str]] = {}
+        local_composites: dict[str, tuple[str, int]] = {}
 
-        def direct_factory_name(expression) -> str | None:
+        def direct_factory(expression) -> tuple[str, str] | None:
             if expression is None or expression.type != "call_expression":
                 return None
             function = expression.child_by_field_name("function")
-            if function is None or function.type != "identifier":
+            if function is None:
                 return None
-            name = _read_text(function, source)
-            return name if name.startswith("New") else None
+            name = ""
+            import_path = ""
+            if function.type == "identifier":
+                name = _read_text(function, source)
+            elif function.type == "selector_expression":
+                field = function.child_by_field_name("field")
+                operand = function.child_by_field_name("operand")
+                qualifier = _read_text(operand, source) if operand is not None else ""
+                if field is None or qualifier not in go_imported_pkgs:
+                    return None
+                name = _read_text(field, source)
+                import_path = go_imported_pkgs[qualifier]
+            return (name, import_path) if name.startswith(("New", "Setup")) else None
 
         def expression_list_items(node) -> list:
             return [child for child in node.children if child.is_named] if node is not None else []
+
+        def direct_composite_type(expression) -> str | None:
+            if expression is None or expression.type != "unary_expression":
+                return None
+            operand = expression.child_by_field_name("operand")
+            if operand is None or operand.type != "composite_literal":
+                return None
+            type_node = operand.child_by_field_name("type")
+            type_name = _read_text(type_node, source).strip() if type_node else ""
+            return type_name if type_name and "." not in type_name else None
 
         def visit(node) -> None:
             if node.type in ("function_declaration", "method_declaration"):
@@ -579,10 +602,15 @@ def extract_go(path: Path) -> dict:
                 names = expression_list_items(left)
                 values = expression_list_items(right)
                 if len(names) == 1 and len(values) == 1 and names[0].type == "identifier":
-                    factory = direct_factory_name(values[0])
+                    factory = direct_factory(values[0])
                     if factory:
                         local_factories[_read_text(names[0], source)] = (
-                            factory, node.start_point[0] + 1,
+                            factory[0], node.start_point[0] + 1, factory[1],
+                        )
+                    composite_type = direct_composite_type(values[0])
+                    if composite_type:
+                        local_composites[_read_text(names[0], source)] = (
+                            composite_type, node.start_point[0] + 1,
                         )
             elif node.type == "call_expression":
                 function = node.child_by_field_name("function")
@@ -591,7 +619,7 @@ def extract_go(path: Path) -> dict:
                 # factory is direct dependency-injection evidence.  The corpus
                 # pass resolves the two concrete factory returns before adding
                 # a dependency edge, so an interface-typed argument is safe.
-                consumer_factory = direct_factory_name(node)
+                consumer_factory = direct_factory(node)
                 if consumer_factory:
                     for argument_index, argument in enumerate(expression_list_items(arguments)):
                         if argument.type != "identifier":
@@ -601,8 +629,10 @@ def extract_go(path: Path) -> dict:
                             continue
                         raw_factory_injections.append({
                             "caller_nid": caller_nid,
-                            "consumer_factory": consumer_factory,
+                            "consumer_factory": consumer_factory[0],
+                            "consumer_import_path": consumer_factory[1],
                             "dependency_factory": dependency_factory[0],
+                            "dependency_import_path": dependency_factory[2],
                             "argument_index": argument_index,
                             "language": "go",
                             "source_file": str_path,
@@ -631,8 +661,34 @@ def extract_go(path: Path) -> dict:
                         raw_registrations.append({
                             "caller_nid": caller_nid,
                             "registry_factory": registry_factory[0],
+                            "registry_import_path": registry_factory[2],
                             "registered_factory": provider_factory[0],
+                            "registered_import_path": provider_factory[2],
                             "method": method,
+                            "language": "go",
+                            "source_file": str_path,
+                            "source_location": f"L{node.start_point[0] + 1}",
+                        })
+            elif node.type == "return_statement" and caller_name.startswith(("New", "Setup")):
+                values = expression_list_items(next(
+                    (child for child in node.children if child.type == "expression_list"), None,
+                ))
+                if len(values) == 1 and values[0].type == "identifier":
+                    returned_name = _read_text(values[0], source)
+                    composite_type = local_composites.get(returned_name)
+                    if composite_type is not None and composite_type[1] < node.start_point[0] + 1:
+                        target_nid = ensure_named_node(composite_type[0], node.start_point[0] + 1)
+                        if target_nid != caller_nid:
+                            add_edge(
+                                caller_nid, target_nid, "constructs", node.start_point[0] + 1,
+                                context="factory_return",
+                            )
+                    delegated_factory = local_factories.get(returned_name)
+                    if delegated_factory is not None and delegated_factory[1] < node.start_point[0] + 1:
+                        raw_factory_returns.append({
+                            "factory": caller_name,
+                            "delegated_factory": delegated_factory[0],
+                            "delegated_import_path": delegated_factory[2],
                             "language": "go",
                             "source_file": str_path,
                             "source_location": f"L{node.start_point[0] + 1}",
@@ -724,9 +780,9 @@ def extract_go(path: Path) -> dict:
         for child in node.children:
             walk_calls(child, caller_nid, local_types)
 
-    for caller_nid, body_node in function_bodies:
+    for caller_nid, body_node, caller_name in function_bodies:
         local_types = emit_local_variable_type_refs(caller_nid, body_node)
-        emit_factory_registration_trace(caller_nid, body_node)
+        emit_factory_registration_trace(caller_nid, body_node, caller_name)
         walk_calls(body_node, caller_nid, local_types)
 
     valid_ids = seen_ids
@@ -743,4 +799,5 @@ def extract_go(path: Path) -> dict:
         "raw_type_refs": raw_type_refs,
         "raw_registrations": raw_registrations,
         "raw_factory_injections": raw_factory_injections,
+        "raw_factory_returns": raw_factory_returns,
     }

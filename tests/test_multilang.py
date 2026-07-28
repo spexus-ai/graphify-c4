@@ -256,17 +256,28 @@ type ProviderImpl struct{}
 func NewProvider() Provider { return &ProviderImpl{} }
 type ServiceImpl struct{}
 func NewService(Registry) *ServiceImpl { return &ServiceImpl{} }
+type HandlerImpl struct{}
+func NewHandler(*ServiceImpl) *HandlerImpl {
+    handler := &HandlerImpl{}
+    return handler
+}
 """,
         encoding="utf-8",
     )
     (tmp_path / "setup.go").write_text(
         """package service
 
+func SetupService(registry Registry) *ServiceImpl {
+    service := NewService(registry)
+    return service
+}
+
 func Setup() {
     registry := NewRegistry()
     provider := NewProvider()
     registry.Register(provider)
-    _ = NewService(registry)
+    service := SetupService(registry)
+    _ = NewHandler(service)
 }
 """,
         encoding="utf-8",
@@ -289,6 +300,7 @@ func Setup() {
         if edge["relation"] == "uses" and edge.get("context") == "factory_injection"
     }
     assert ("ServiceImpl", "RegistryImpl") in injections
+    assert ("HandlerImpl", "ServiceImpl") in injections
 
 def test_go_finds_constructor():
     r = extract_go(FIXTURES / "sample.go")
