@@ -74,6 +74,23 @@ def test_ts_calls_are_extracted():
             assert e["confidence"] == "EXTRACTED"
 
 
+def test_tsx_extracts_component_render_edges(tmp_path):
+    source = tmp_path / "view.tsx"
+    source.write_text(
+        """function EmptyState() { return <span />; }
+function ActionState() { return <button />; }
+function MembersView() {
+  return <section><EmptyState /><ActionState /></section>;
+}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_js(source)
+    assert ("MembersView", "EmptyState") in _edge_labels(result, "renders", "jsx")
+    assert ("MembersView", "ActionState") in _edge_labels(result, "renders", "jsx")
+
+
 def test_ts_import_edges_have_import_context():
     r = extract_js(FIXTURES / "sample.ts")
     import_edges = _edges_with_relation(r, "imports", "imports_from")

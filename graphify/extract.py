@@ -5482,8 +5482,8 @@ def extract(
             all_edges.append({
                 "source": caller,
                 "target": tgt,
-                "relation": "calls",
-                "context": "call",
+                "relation": rc.get("relation", "calls"),
+                "context": rc.get("context", "call"),
                 "confidence": confidence,
                 "confidence_score": confidence_score,
                 "resolution": resolution,

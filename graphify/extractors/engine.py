@@ -4429,6 +4429,65 @@ def _extract_generic(
     for owner_nid, init_node in initializer_nodes:
         walk_calls(init_node, owner_nid)
 
+    # ── React/TSX render graph ───────────────────────────────────────────────
+    # A JSX component invocation is not a JavaScript call_expression, so the
+    # ordinary call graph cannot see `return <EmptyState />`.  Treat it as its
+    # own extracted relation rather than pretending it is a function call:
+    # consumers can distinguish rendering/composition from imperative calls.
+    if path.suffix.lower() == ".tsx":
+        seen_render_pairs: set[tuple[str, str]] = set()
+
+        def jsx_component_name(node) -> str | None:
+            name_node = node.child_by_field_name("name")
+            if name_node is None:
+                name_node = next((child for child in node.children if child.is_named), None)
+            if name_node is None:
+                return None
+            name = _read_text(name_node, source)
+            # Native tags are lower-case.  Namespace/member JSX (`UI.Button`)
+            # needs binding-aware resolution and is deliberately left for a
+            # later pass rather than guessed from its final segment.
+            if not name or "." in name or not name[:1].isupper():
+                return None
+            return name
+
+        def walk_jsx(node, caller_nid: str) -> None:
+            if node.type in ("jsx_opening_element", "jsx_self_closing_element"):
+                component_name = jsx_component_name(node)
+                if component_name:
+                    target_nid = label_to_nid.get(component_name)
+                    if target_nid and target_nid != caller_nid and target_nid in callable_def_nids:
+                        pair = (caller_nid, target_nid)
+                        if pair not in seen_render_pairs:
+                            seen_render_pairs.add(pair)
+                            edges.append({
+                                "source": caller_nid,
+                                "target": target_nid,
+                                "relation": "renders",
+                                "context": "jsx",
+                                "confidence": "EXTRACTED",
+                                "source_file": str_path,
+                                "source_location": f"L{node.start_point[0] + 1}",
+                                "weight": 1.0,
+                            })
+                    elif target_nid is None:
+                        # Preserve a direct imported component reference for the
+                        # cross-file resolver, which will require import proof.
+                        raw_calls.append({
+                            "caller_nid": caller_nid,
+                            "callee": component_name,
+                            "is_member_call": False,
+                            "relation": "renders",
+                            "context": "jsx",
+                            "source_file": str_path,
+                            "source_location": f"L{node.start_point[0] + 1}",
+                        })
+            for child in node.children:
+                walk_jsx(child, caller_nid)
+
+        for caller_nid, body_node in function_bodies:
+            walk_jsx(body_node, caller_nid)
+
     # ── Event listener pass ───────────────────────────────────────────────────
     seen_listen_pairs: set[tuple[str, str]] = set()
     for event_name, listener_name, line in pending_listen_edges:
