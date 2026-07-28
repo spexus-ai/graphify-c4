@@ -8,9 +8,11 @@ from graphify.architecture import (
     build_projection,
     compose_workspace_graph,
     conformance,
+    format_dependency_resolutions,
     down,
     impact,
     load_model,
+    resolve_dependency_rules,
     suspect_dependencies,
     sync_workspace,
     up,
@@ -200,6 +202,31 @@ def test_conformance_reports_forbidden_undeclared_and_unmapped_code():
     assert next(finding for finding in findings if finding["kind"] == "forbidden_dependency")["rule"] == "front-no-db"
 
 
+def test_dependency_rules_resolve_observed_edges_into_a_machine_readable_ledger():
+    projection = build_projection(MODEL, GRAPH)
+
+    resolutions = resolve_dependency_rules(projection)
+
+    assert resolutions == [{
+        "source": "front.ui", "target": "database", "relation": "calls", "status": "denied",
+        "rules": ["front-no-db"], "evidence_count": 1,
+    }]
+    assert projection["dependency_resolutions"] == resolutions
+    assert format_dependency_resolutions(resolutions) == (
+        "Dependency rules:\n"
+        "- front.ui --calls--> database: denied [1 evidence; rules: front-no-db]"
+    )
+
+
+def test_dependency_rule_resolution_marks_declared_and_undeclared_edges():
+    model = {**MODEL, "rules": [], "relations": [{"source": "front", "target": "database", "kind": "uses"}]}
+    declared = resolve_dependency_rules(build_projection(model, GRAPH))
+    undeclared = resolve_dependency_rules(build_projection({**model, "relations": []}, GRAPH))
+
+    assert declared[0]["status"] == "declared"
+    assert undeclared[0]["status"] == "undeclared"
+
+
 def test_suspect_dependencies_require_namespace_or_import_proof():
     graph = {
         **GRAPH,
@@ -335,6 +362,24 @@ def test_architecture_sync_cli_writes_sidecar_without_changing_graph(monkeypatch
     saved = json.loads(out_path.read_text(encoding="utf-8"))
     assert saved["schema"] == "graphify.architecture/v1"
     assert saved["observed_relations"][0]["source"] == "front.ui"
+
+
+def test_architecture_dependencies_cli_resolves_the_rule_ledger(monkeypatch, tmp_path, capsys):
+    model_path = tmp_path / "model.json"
+    graph_path = tmp_path / "graph.json"
+    model_path.write_text(json.dumps({**MODEL, "rules": []}), encoding="utf-8")
+    graph_path.write_text(json.dumps(GRAPH), encoding="utf-8")
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv", [
+        "graphify", "architecture", "dependencies", "--model", str(model_path), "--graph", str(graph_path),
+    ])
+
+    mainmod.main()
+
+    assert capsys.readouterr().out == (
+        "Dependency rules:\n"
+        "- front.ui --calls--> database: undeclared [1 evidence]\n"
+    )
 
 
 def test_architecture_html_cli_writes_interactive_c4_view(monkeypatch, tmp_path, capsys):

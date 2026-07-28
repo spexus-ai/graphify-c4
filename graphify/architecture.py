@@ -628,7 +628,7 @@ def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, 
         observed_code_relations.append(item)
     observed_code_relations.sort(key=lambda relation: (relation["source"], relation["target"], relation["kind"]))
 
-    return {
+    projection = {
         "schema": SCHEMA,
         "elements": elements_list + code_elements,
         "declared_relations": model.get("relations", []),
@@ -640,6 +640,8 @@ def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, 
         "observed_relations": observed_relations,
         "observed_code_relations": observed_code_relations,
     }
+    projection["dependency_resolutions"] = resolve_dependency_rules(projection)
+    return projection
 
 
 def _declared_covers(
@@ -654,17 +656,19 @@ def _declared_covers(
     )
 
 
-def conformance(projection: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return deterministic architecture findings; only hard facts are errors."""
-    elements = {element["id"]: element for element in projection["elements"]}
-    findings: list[dict[str, Any]] = []
-    for node_id in projection["ambiguous_code_nodes"]:
-        findings.append({"severity": "error", "kind": "ambiguous_mapping", "node": node_id})
-    for node_id in projection["unmapped_code_nodes"]:
-        findings.append({"severity": "warning", "kind": "unmapped_code", "node": node_id})
+def resolve_dependency_rules(projection: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve every observed C4 dependency against declared relations and deny rules.
 
+    The result is deliberately a compact, machine-readable decision ledger.  It
+    lets a CI job or an architecture-research workflow distinguish an explicit
+    policy violation from a dependency that simply still needs to be declared.
+    A deny rule has precedence over a matching declared relation.
+    """
+    elements = {element["id"]: element for element in projection["elements"]}
     declared_relations = projection.get("declared_relations", [])
+    resolutions: list[dict[str, Any]] = []
     for observed in projection["observed_relations"]:
+        matching_rules: list[str] = []
         for rule in projection.get("rules", []):
             deny = rule.get("deny", {}) if isinstance(rule, dict) else {}
             source_matches = _is_descendant(str(observed["source"]), str(deny.get("source", "")), elements)
@@ -676,25 +680,62 @@ def conformance(projection: dict[str, Any]) -> list[dict[str, Any]]:
                 and elements.get(str(observed["target"]), {}).get("c4_type") == deny["target_type"]
             )
             if source_matches and target_matches:
+                matching_rules.append(str(rule.get("id", "unnamed-rule")))
+        declared = any(_declared_covers(observed, relation, elements) for relation in declared_relations)
+        status = "denied" if matching_rules else "declared" if declared else "undeclared"
+        resolutions.append({
+            "source": observed["source"],
+            "target": observed["target"],
+            "relation": observed["kind"],
+            "status": status,
+            "rules": sorted(matching_rules),
+            "evidence_count": len(observed["evidence"]),
+        })
+    return sorted(
+        resolutions,
+        key=lambda item: (item["source"], item["target"], item["relation"]),
+    )
+
+
+def conformance(projection: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return deterministic architecture findings; only hard facts are errors."""
+    findings: list[dict[str, Any]] = []
+    for node_id in projection["ambiguous_code_nodes"]:
+        findings.append({"severity": "error", "kind": "ambiguous_mapping", "node": node_id})
+    for node_id in projection["unmapped_code_nodes"]:
+        findings.append({"severity": "warning", "kind": "unmapped_code", "node": node_id})
+
+    evidence_by_dependency = {
+        (item["source"], item["target"], item["kind"]): item["evidence"]
+        for item in projection["observed_relations"]
+    }
+    for resolution in resolve_dependency_rules(projection):
+        evidence = evidence_by_dependency[(resolution["source"], resolution["target"], resolution["relation"])]
+        if resolution["status"] == "denied":
+            for rule_id in resolution["rules"]:
                 findings.append(
                     {
                         "severity": "error",
                         "kind": "forbidden_dependency",
-                        "rule": rule.get("id", "unnamed-rule"),
-                        "source": observed["source"],
-                        "target": observed["target"],
-                        "evidence": observed["evidence"],
+                        "rule": rule_id,
+                        "source": resolution["source"],
+                        "target": resolution["target"],
+                        "evidence": evidence,
                     }
                 )
-        if not any(_declared_covers(observed, declared, elements) for declared in declared_relations):
+        # A forbidden edge is also useful as an undeclared-dependency finding:
+        # fixing the rule violation does not automatically document the intended
+        # replacement dependency.  Retain the pre-resolution conformance
+        # semantics while exposing the higher-priority denial in the ledger.
+        if resolution["status"] != "declared":
             findings.append(
                 {
                     "severity": "warning",
                     "kind": "undeclared_dependency",
-                    "source": observed["source"],
-                    "target": observed["target"],
-                    "relation": observed["kind"],
-                    "evidence": observed["evidence"],
+                    "source": resolution["source"],
+                    "target": resolution["target"],
+                    "relation": resolution["relation"],
+                    "evidence": evidence,
                 }
             )
     return findings
@@ -1246,6 +1287,21 @@ def format_findings(findings: Iterable[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def format_dependency_resolutions(resolutions: Iterable[dict[str, Any]]) -> str:
+    """Render the dependency-rule ledger for people and CI logs."""
+    values = list(resolutions)
+    if not values:
+        return "Dependency rules: no cross-component dependencies"
+    lines = ["Dependency rules:"]
+    for item in values:
+        suffix = f"; rules: {', '.join(item['rules'])}" if item["rules"] else ""
+        lines.append(
+            f"- {item['source']} --{item['relation']}--> {item['target']}: "
+            f"{item['status']} [{item['evidence_count']} evidence{suffix}]"
+        )
+    return "\n".join(lines)
+
+
 def _common_paths(args: list[str]) -> tuple[Path, Path, Path, list[str]]:
     """Read shared architecture command flags and return unconsumed arguments."""
     model_path = Path("architecture/graphify.c4.json")
@@ -1284,6 +1340,7 @@ Commands:
   init       create architecture/graphify.c4.json without overwriting it
   sync       project graph.json onto the declared C4 model
   validate   report model/conformance violations (exit 2 on errors)
+  dependencies resolve each observed dependency against declared relations and deny rules
   audit      list cross-component edges without namespace/import proof
   view       show one C4 level: --level context|container|component|code
   html       write an interactive architecture.html browser view
@@ -1492,6 +1549,12 @@ def dispatch_cli(args: list[str]) -> int:
                 raise ValueError("validate accepts only common path options")
             print(format_findings(projection["findings"]))
             return 2 if any(item["severity"] == "error" for item in projection["findings"]) else 0
+
+        if command == "dependencies":
+            if rest:
+                raise ValueError("dependencies accepts only common path options")
+            print(format_dependency_resolutions(projection["dependency_resolutions"]))
+            return 2 if any(item["status"] == "denied" for item in projection["dependency_resolutions"]) else 0
 
         if command == "audit":
             if rest and rest != ["--suspect"]:
