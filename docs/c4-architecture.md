@@ -26,8 +26,8 @@ boundaries before treating it as an architectural source of truth.
 
 The model uses the schema `graphify.architecture/v1`. Elements have stable IDs,
 a C4 type, optional parent, and optional implementation selectors. Supported
-selectors are `path_prefix`, `path_glob`, `source_file`, `node_id`, `label`, and
-`label_regex`.
+selectors are `path_prefix`, `path_glob`, `source_file`, `source_file_regex`,
+`node_id`, `label`, `label_regex`, and metadata fields.
 
 ```json
 {
@@ -92,6 +92,29 @@ convention. Use `structural` for files containing several selected classes: the
 component then owns only the root and direct structural members. Generated roots
 take precedence over a broad folder selector; two generated roots claiming the
 same code are reported as an ambiguous mapping instead of silently choosing one.
+
+For an implementation-only Component view, a generator can additionally require
+an extracted root relation and AST metadata, then attach a visual, non-hierarchical
+layer. This keeps package paths useful as selection rules without rendering them
+as grouping nodes:
+
+```json
+{
+  "id_prefix": "component.service",
+  "parent": "container.back",
+  "root_relation": "method",
+  "selector": {
+    "path_prefix": "back/internal/service",
+    "metadata": {"language": "go", "kind": "struct"}
+  },
+  "layer": "Application Service",
+  "visual": {"shape": "square", "color": "#D55E00"}
+}
+```
+
+`source_file_regex` is available alongside `label_regex` for conventions such
+as React components in `*.tsx`. The interactive explorer renders `layer` with
+both colour and shape; it does not turn a layer into a C4 parent or package node.
 
 ## Multi-repository workspace
 

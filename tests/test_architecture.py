@@ -116,6 +116,44 @@ def test_component_generator_creates_symbol_components_and_overrides_folder_mapp
     assert projection["ambiguous_code_nodes"] == []
 
 
+def test_component_generator_can_require_symbol_metadata_and_a_structural_relation():
+    model = {
+        "schema": "graphify.architecture/v1",
+        "scope": {"include": ["src/**"]},
+        "elements": [
+            {"id": "system", "c4_type": "software_system", "name": "System"},
+            {"id": "api", "c4_type": "container", "parent": "system", "name": "API"},
+        ],
+        "component_generators": [{
+            "id_prefix": "api.service",
+            "parent": "api",
+            "layer": "Application Service",
+            "visual": {"shape": "square", "color": "#0072B2"},
+            "root_relation": "method",
+            "selector": {"metadata": {"language": "go", "kind": "struct"}},
+        }],
+        "relations": [], "rules": [],
+    }
+    graph = {
+        "nodes": [
+            {"id": "contract", "label": "RoleService", "file_type": "code", "source_file": "src/role.go",
+             "metadata": {"language": "go", "kind": "interface"}},
+            {"id": "implementation", "label": "roleService", "file_type": "code", "source_file": "src/role.go",
+             "metadata": {"language": "go", "kind": "struct"}},
+            {"id": "method", "label": ".Create()", "file_type": "code", "source_file": "src/role.go"},
+        ],
+        "links": [{"source": "implementation", "target": "method", "relation": "method"}],
+    }
+
+    projection = build_projection(model, graph)
+
+    generated = next(item for item in projection["elements"] if item["id"] == "api.service.implementation")
+    assert generated["name"] == "roleService"
+    assert generated["layer"] == "Application Service"
+    assert generated["visual"] == {"shape": "square", "color": "#0072B2"}
+    assert "contract" not in projection["mappings"]
+
+
 def test_projection_rolls_code_relationships_to_c4_and_retains_evidence():
     projection = build_projection(MODEL, GRAPH)
 

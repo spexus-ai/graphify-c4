@@ -108,6 +108,28 @@ def test_go_finds_methods():
     assert any("Start" in l for l in labels)
     assert any("Stop" in l for l in labels)
 
+
+def test_go_keeps_exported_interface_and_unexported_struct_distinct(tmp_path):
+    source = tmp_path / "service.go"
+    source.write_text(
+        """package service
+
+type RoleService interface { Create() }
+type roleService struct{}
+func (s *roleService) Create() {}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_go(source)
+    by_label = {node["label"]: node for node in result["nodes"]}
+    method_edge = next(edge for edge in result["edges"] if edge["relation"] == "method")
+
+    assert by_label["RoleService"]["id"] != by_label["roleService"]["id"]
+    assert by_label["RoleService"]["metadata"]["kind"] == "interface"
+    assert by_label["roleService"]["metadata"]["kind"] == "struct"
+    assert method_edge["source"] == by_label["roleService"]["id"]
+
 def test_go_finds_constructor():
     r = extract_go(FIXTURES / "sample.go")
     assert any("NewServer" in l for l in _labels(r))

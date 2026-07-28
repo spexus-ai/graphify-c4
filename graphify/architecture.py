@@ -158,19 +158,24 @@ def validate_model(model: object) -> list[str]:
                     errors.append(f"element '{element_id}' implementation {selector_index} must be an object")
                 elif not any(
                     key in selector
-                    for key in ("path_prefix", "path_glob", "source_file", "node_id", "label", "label_regex")
+                    for key in (
+                        "path_prefix", "path_glob", "source_file", "source_file_regex", "node_id", "label",
+                        "label_regex", "metadata",
+                    )
                 ):
                     errors.append(
                         f"element '{element_id}' implementation {selector_index} needs "
-                        "path_prefix, path_glob, source_file, node_id, label, or label_regex"
+                        "path_prefix, path_glob, source_file, source_file_regex, node_id, label, label_regex, or metadata"
                     )
-                elif "label_regex" in selector:
+                elif "label_regex" in selector or "source_file_regex" in selector:
                     try:
-                        re.compile(str(selector["label_regex"]))
+                        re.compile(str(selector.get("label_regex", selector.get("source_file_regex"))))
                     except re.error as exc:
                         errors.append(
-                            f"element '{element_id}' implementation {selector_index} has invalid label_regex: {exc}"
+                            f"element '{element_id}' implementation {selector_index} has invalid regex: {exc}"
                         )
+                elif "metadata" in selector and not isinstance(selector["metadata"], dict):
+                    errors.append(f"element '{element_id}' implementation {selector_index} metadata must be an object")
 
     for element_id, element in by_id.items():
         parent = element.get("parent")
@@ -200,19 +205,31 @@ def validate_model(model: object) -> list[str]:
             errors.append(f"component generator {index} needs a selector object")
         elif not any(
             key in selector
-            for key in ("path_prefix", "path_glob", "source_file", "node_id", "label", "label_regex")
+            for key in (
+                "path_prefix", "path_glob", "source_file", "source_file_regex", "node_id", "label",
+                "label_regex", "metadata",
+            )
         ):
             errors.append(f"component generator {index} selector needs a node, path, or label matcher")
-        elif "label_regex" in selector:
+        elif "label_regex" in selector or "source_file_regex" in selector:
             try:
-                re.compile(str(selector["label_regex"]))
+                re.compile(str(selector.get("label_regex", selector.get("source_file_regex"))))
             except re.error as exc:
-                errors.append(f"component generator {index} has invalid label_regex: {exc}")
+                errors.append(f"component generator {index} has invalid regex: {exc}")
+        elif "metadata" in selector and not isinstance(selector["metadata"], dict):
+            errors.append(f"component generator {index} selector metadata must be an object")
         ownership = generator.get("ownership", "file_if_unique")
         if ownership not in {"file_if_unique", "structural"}:
             errors.append(
                 f"component generator {index} ownership must be 'file_if_unique' or 'structural'"
             )
+        root_relation = generator.get("root_relation")
+        if root_relation is not None and (not isinstance(root_relation, str) or not root_relation.strip()):
+            errors.append(f"component generator {index} root_relation must be a non-empty string")
+        if "layer" in generator and (not isinstance(generator["layer"], str) or not generator["layer"].strip()):
+            errors.append(f"component generator {index} layer must be a non-empty string")
+        if "visual" in generator and not isinstance(generator["visual"], dict):
+            errors.append(f"component generator {index} visual must be an object")
 
     for element_id in by_id:
         current: str | None = element_id
@@ -317,6 +334,8 @@ def _matches_selector(node_id: str, node: dict[str, Any], selector: dict[str, An
         return False
     if "source_file" in selector and source_file != _normalise_path(selector["source_file"]):
         return False
+    if "source_file_regex" in selector and re.fullmatch(str(selector["source_file_regex"]), source_file) is None:
+        return False
     if "path_prefix" in selector:
         prefix = _normalise_path(selector["path_prefix"]).rstrip("/")
         if not (source_file == prefix or source_file.startswith(prefix + "/")):
@@ -329,6 +348,13 @@ def _matches_selector(node_id: str, node: dict[str, Any], selector: dict[str, An
         str(selector["label_regex"]), str(node.get("label", ""))
     ) is None:
         return False
+    if "metadata" in selector:
+        node_metadata = node.get("metadata")
+        if not isinstance(node_metadata, dict):
+            return False
+        for key, value in selector["metadata"].items():
+            if node_metadata.get(key) != value:
+                return False
     return True
 
 
@@ -415,9 +441,16 @@ def _generated_components(
         selector = generator.get("selector", {})
         if not isinstance(selector, dict):
             continue
+        root_relation = generator.get("root_relation")
+        relation_sources = {
+            str(link.get("_src") or link.get("source") or "")
+            for link in _links(graph)
+            if str(link.get("relation") or "") == root_relation
+        }
         roots = [
             node_id for node_id, node in sorted(production_nodes.items())
             if _matches_selector(node_id, node, selector)
+            and (root_relation is None or node_id in relation_sources)
         ]
         roots_by_file: dict[str, list[str]] = defaultdict(list)
         for root in roots:
@@ -444,12 +477,27 @@ def _generated_components(
                     label=str(node.get("label") or root), node_id=root,
                     source_file=_normalise_path(node.get("source_file")),
                 )
+            if isinstance(generator.get("layer"), str):
+                element["layer"] = generator["layer"]
+            if isinstance(generator.get("visual"), dict):
+                element["visual"] = dict(generator["visual"])
             elements.append(element)
             source_file = _normalise_path(node.get("source_file"))
             if generator.get("ownership", "file_if_unique") == "file_if_unique" and len(roots_by_file[source_file]) == 1:
                 members = {
                     node_id for node_id, candidate in production_nodes.items()
                     if _normalise_path(candidate.get("source_file")) == source_file
+                    # An adjacent declared type is its own architecture root,
+                    # not file-local implementation detail. This is crucial in
+                    # Go where an interface and its struct implementation often
+                    # share one source file (RoleService / roleService).
+                    and (
+                        node_id == root
+                        or not isinstance(candidate.get("metadata"), dict)
+                        or candidate["metadata"].get("kind") not in {
+                            "struct", "interface", "class", "object", "enum",
+                        }
+                    )
                 }
             else:
                 members = _structural_members(root, _links(graph)) & set(production_nodes)

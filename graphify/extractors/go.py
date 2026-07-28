@@ -12,6 +12,19 @@ _GO_PREDECLARED_TYPES = frozenset({
     "uint", "uint8", "uint16", "uint32", "uint64", "uintptr", "any", "comparable",
 })
 
+
+def _go_type_id(package_scope: str, name: str) -> str:
+    """Return an ID that preserves Go's exported/unexported type distinction.
+
+    Graphify IDs are intentionally case-folded for cross-language matching, but
+    Go treats ``RoleService`` and ``roleService`` as distinct symbols.  Only the
+    latter needs a stable suffix to avoid collapsing that valid pair while
+    retaining existing IDs for the overwhelmingly common exported declaration.
+    """
+    if name and not name[0].isupper():
+        return _make_id(package_scope, name, "unexported")
+    return _make_id(package_scope, name)
+
 def _go_collect_type_refs(node, source: bytes, generic: bool, out: list[tuple[str, str]]) -> None:
     """Walk a Go type expression; append (name, role) tuples."""
     if node is None:
@@ -82,16 +95,32 @@ def extract_go(path: Path) -> dict:
     go_imported_pkgs: dict[str, str] = {}  # local package name/alias -> import path
     raw_type_refs: list[dict] = []
 
-    def add_node(nid: str, label: str, line: int) -> None:
-        if nid not in seen_ids:
-            seen_ids.add(nid)
-            nodes.append({
-                "id": nid,
-                "label": label,
-                "file_type": "code",
-                "source_file": str_path,
-                "source_location": f"L{line}",
-            })
+    def add_node(
+        nid: str, label: str, line: int, metadata: dict[str, object] | None = None,
+    ) -> None:
+        if nid in seen_ids:
+            # A type reference may have created a sourceless placeholder before
+            # the declaration is visited. Promote it to the real declaration.
+            for item in nodes:
+                if item["id"] == nid:
+                    if not item.get("source_file"):
+                        item["source_file"] = str_path
+                        item["source_location"] = f"L{line}"
+                    if metadata:
+                        item["metadata"] = metadata
+                    return
+            return
+        seen_ids.add(nid)
+        item = {
+            "id": nid,
+            "label": label,
+            "file_type": "code",
+            "source_file": str_path,
+            "source_location": f"L{line}",
+        }
+        if metadata:
+            item["metadata"] = metadata
+        nodes.append(item)
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0,
@@ -113,8 +142,42 @@ def extract_go(path: Path) -> dict:
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
 
+    # Tree-sitter visits declarations in source order, while methods can appear
+    # before the type declaration that owns them. Pre-scan type kinds so a
+    # receiver node receives its semantic kind even in that ordering.
+    declared_type_kinds: dict[str, str] = {}
+
+    def collect_type_kinds(node) -> None:
+        if node.type == "type_declaration":
+            for child in node.children:
+                if child.type != "type_spec":
+                    continue
+                name_node = child.child_by_field_name("name")
+                if name_node is None:
+                    continue
+                type_kind = next(
+                    (candidate.type for candidate in child.children if candidate.type in {"struct_type", "interface_type"}),
+                    None,
+                )
+                if type_kind is not None:
+                    declared_type_kinds[_read_text(name_node, source)] = type_kind.removesuffix("_type")
+        for child in node.children:
+            collect_type_kinds(child)
+
+    collect_type_kinds(root)
+
+    def type_metadata(name: str) -> dict[str, object] | None:
+        type_kind = declared_type_kinds.get(name)
+        if type_kind is None:
+            return None
+        return {
+            "language": "go",
+            "kind": type_kind,
+            "visibility": "exported" if name and name[0].isupper() else "unexported",
+        }
+
     def ensure_named_node(name: str, line: int) -> str:
-        nid = _make_id(pkg_scope, name)
+        nid = _go_type_id(pkg_scope, name)
         if nid in seen_ids:
             return nid
         nid = _make_id(name)
@@ -240,8 +303,8 @@ def extract_go(path: Path) -> dict:
             line = node.start_point[0] + 1
 
             if receiver_type:
-                parent_nid = _make_id(pkg_scope, receiver_type)
-                add_node(parent_nid, receiver_type, line)
+                parent_nid = _go_type_id(pkg_scope, receiver_type)
+                add_node(parent_nid, receiver_type, line, type_metadata(receiver_type))
                 method_nid = _make_id(parent_nid, method_name)
                 add_node(method_nid, f".{method_name}()", line)
                 add_edge(parent_nid, method_nid, "method", line)
@@ -265,8 +328,8 @@ def extract_go(path: Path) -> dict:
                     continue
                 type_name = _read_text(name_node, source)
                 line = child.start_point[0] + 1
-                type_nid = _make_id(pkg_scope, type_name)
-                add_node(type_nid, type_name, line)
+                type_nid = _go_type_id(pkg_scope, type_name)
+                add_node(type_nid, type_name, line, type_metadata(type_name))
                 add_edge(file_nid, type_nid, "contains", line)
                 # Type body: struct fields (with embeds) or interface embedding.
                 type_body = None
