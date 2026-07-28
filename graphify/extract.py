@@ -1180,6 +1180,7 @@ def extract_js(path: Path) -> dict:
     result = _extract_generic(path, config)
     if "error" not in result:
         _extract_js_rationale(path, result)
+        _extract_js_dynamic_imports(path, result)
     return result
 
 
@@ -1365,6 +1366,38 @@ def _emit_rescued_import(
     })
     result.setdefault("edges", []).append(edge)
     existing_ids.add(node_id)
+
+
+def _extract_js_dynamic_imports(path: Path, result: dict) -> None:
+    """Recover statically-addressable ``import()`` calls outside callable bodies.
+
+    The AST call walker records imports reached from a named function.  Framework
+    wiring often puts a dynamic import in a top-level callback instead, for
+    example ``const Page = lazy(() => import('./Page'))``.  That callback has no
+    standalone graph node, but its importing module is still unambiguous.  A
+    module-level deferred edge gives subsequent JSX/call resolution the import
+    proof required to connect the router to the lazily loaded component.
+    """
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+        existing_ids = {node["id"] for node in result.get("nodes", [])}
+        aliases = _load_tsconfig_aliases(path.parent)
+        base_url = _load_tsconfig_base_url(path.parent)
+        for match in re.finditer(r"""\bimport\(\s*['\"]([^'\"]+)['\"]\s*\)""", source):
+            raw = match.group(1)
+            if raw:
+                _emit_rescued_import(
+                    result,
+                    existing_ids,
+                    _make_id(str(path)),
+                    path,
+                    raw,
+                    "dynamic_import",
+                    aliases,
+                    base_url,
+                )
+    except OSError:
+        return
 
 
 def extract_svelte(path: Path) -> dict:
@@ -1911,6 +1944,12 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
     for stub in stubs:
         stub_id = str(stub.get("id", ""))
         if not stub_id:
+            continue
+        # Go (and future language-aware extractors) can mark a type reference
+        # as namespace-qualified.  A generic label match cannot prove such a
+        # reference points at a project definition, so preserve the external
+        # stub instead of fabricating a cross-component edge.
+        if stub.get("_qualified_ref"):
             continue
         candidates = real_by_label.get(_node_label_key(stub), [])
         if len(candidates) != 1:
@@ -4277,7 +4316,7 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     ProcessPoolExecutor.
 
     Args:
-        args: (index, path_str, root_str, cache_location_str) tuple. ``root``
+        args: (index, path_str, root_str, cache_location_str, force) tuple. ``root``
             anchors hash keys / node ids / the XAML boundary; ``cache_location``
             is where the cache dir is written, decoupled per #1774. A legacy
             3-tuple (no cache_location) is still accepted for back-compat.
@@ -4285,7 +4324,10 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     Returns:
         (index, result_dict) so results can be placed back in order.
     """
-    if len(args) == 4:
+    force = False
+    if len(args) == 5:
+        idx, path_str, root_str, cache_location_str, force = args
+    elif len(args) == 4:
         idx, path_str, root_str, cache_location_str = args
     else:  # legacy 3-tuple: location == anchor
         idx, path_str, root_str = args
@@ -4297,7 +4339,7 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
 
     # Check cache first (avoid re-extraction)
-    if not bypass_cache:
+    if not force and not bypass_cache:
         cached = load_cached(path, root, cache_root=cache_location)
         if cached is not None:
             return idx, cached
@@ -4324,6 +4366,7 @@ def _extract_parallel(
     max_workers: int | None,
     total_files: int,
     cache_location: Path | None = None,
+    force: bool = False,
 ) -> bool:
     """Extract uncached files in parallel using ProcessPoolExecutor.
 
@@ -4373,7 +4416,7 @@ def _extract_parallel(
     # the cache dir is written (defaults to root when not decoupled) (#1774).
     root_str = str(root)
     cache_loc_str = str(cache_location if cache_location is not None else root)
-    work_items = [(idx, str(path), root_str, cache_loc_str) for idx, path in uncached_work]
+    work_items = [(idx, str(path), root_str, cache_loc_str, force) for idx, path in uncached_work]
 
     done_count = 0
     _PROGRESS_INTERVAL = 100
@@ -4476,6 +4519,7 @@ def extract(
     root: Path | None = None,
     parallel: bool = True,
     max_workers: int | None = None,
+    force: bool = False,
 ) -> dict:
     """Extract AST nodes and edges from a list of code files.
 
@@ -4498,6 +4542,7 @@ def extract(
             use ProcessPoolExecutor for multi-core extraction.
         max_workers: max subprocess count. Defaults to cpu_count (or the
             value of GRAPHIFY_MAX_WORKERS if set), bounded by len(uncached_work).
+        force: re-extract every source file instead of serving AST cache entries.
     """
     paths = [Path(p) for p in paths]
     anchor_root = Path(root) if root is not None else None
@@ -4552,7 +4597,7 @@ def extract(
             per_file[i] = {"nodes": [], "edges": []}
             continue
         bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
-        if not bypass_cache:
+        if not force and not bypass_cache:
             cached = load_cached(path, root, cache_root=cache_location)
             if cached is not None:
                 per_file[i] = cached
@@ -4563,9 +4608,14 @@ def extract(
     if uncached_work:
         ran_parallel = False
         if parallel and len(uncached_work) >= _PARALLEL_THRESHOLD:
-            ran_parallel = _extract_parallel(
-                uncached_work, per_file, root, max_workers, total, cache_location
-            )
+            if force:
+                ran_parallel = _extract_parallel(
+                    uncached_work, per_file, root, max_workers, total, cache_location, force=True
+                )
+            else:
+                ran_parallel = _extract_parallel(
+                    uncached_work, per_file, root, max_workers, total, cache_location
+                )
         if not ran_parallel:
             _extract_sequential(uncached_work, per_file, root, total, cache_location)
 
@@ -4650,10 +4700,31 @@ def extract(
     all_nodes: list[dict] = []
     all_edges: list[dict] = []
     all_raw_calls: list[dict] = []
-    for result in per_file:
+    all_raw_type_refs: list[dict] = []
+    all_raw_registrations: list[dict] = []
+    all_raw_factory_injections: list[dict] = []
+    all_raw_factory_returns: list[dict] = []
+    # Extractors retain a convenient basename in ``source_file``.  Keep the
+    # project-relative directory separately while aggregating: Go package
+    # imports are directory-addressed and two ``service.go`` files can coexist.
+    nid_to_project_dir: dict[str, str] = {}
+    for result, source_path in zip(per_file, paths):
         all_nodes.extend(result.get("nodes", []))
         all_edges.extend(result.get("edges", []))
         all_raw_calls.extend(result.get("raw_calls", []))
+        all_raw_type_refs.extend(result.get("raw_type_refs", []))
+        all_raw_registrations.extend(result.get("raw_registrations", []))
+        all_raw_factory_injections.extend(result.get("raw_factory_injections", []))
+        all_raw_factory_returns.extend(result.get("raw_factory_returns", []))
+        try:
+            relative_dir = source_path.resolve().relative_to(root.resolve()).parent.as_posix()
+        except (OSError, RuntimeError, ValueError):
+            relative_dir = source_path.parent.as_posix()
+        relative_dir = relative_dir.strip(".")
+        for node in result.get("nodes", []):
+            nid = node.get("id")
+            if nid:
+                nid_to_project_dir[str(nid)] = relative_dir
     # Function / method / class def ids for the cross-file indirect_call callable
     # guard. Built from the `_callable` node marker AFTER the id-remap / disambiguation
     # passes below (which rewrite node ids), so it can never go stale — see the
@@ -4855,6 +4926,14 @@ def extract(
                 cn = rc.get("caller_nid")
                 if cn in sym_remap:
                     rc["caller_nid"] = sym_remap[cn]
+            for type_ref in all_raw_type_refs:
+                source_nid = type_ref.get("source_nid")
+                if source_nid in sym_remap:
+                    type_ref["source_nid"] = sym_remap[source_nid]
+            for old_nid, new_nid in sym_remap.items():
+                project_dir = nid_to_project_dir.pop(old_nid, None)
+                if project_dir is not None:
+                    nid_to_project_dir[new_nid] = project_dir
         if edge_alias_candidates:
             def _edge_key(edge: dict) -> str:
                 # target_file is a transient stamp (#1814/#1983); exclude it
@@ -4980,7 +5059,9 @@ def extract(
     # graph is identical regardless of scan root (#2072).
     _repoint_python_package_imports(paths, all_nodes, all_edges, root)
     _merge_swift_extensions(per_file, all_nodes, all_edges)
-    _disambiguate_colliding_node_ids(all_nodes, all_edges, all_raw_calls, root)
+    _disambiguate_colliding_node_ids(
+        all_nodes, all_edges, all_raw_calls, root, raw_type_refs=all_raw_type_refs
+    )
     _canonicalize_csharp_namespace_nodes(all_nodes, all_edges)
     # PHP namespace/use disambiguation must run BEFORE the unique-stub rewire:
     # the false merge (#1923) happens inside the rewire when a bare-name stub
@@ -5119,6 +5200,21 @@ def extract(
     # function/method/class, never a same-named data symbol, and the guard never goes
     # stale when node ids were relativized/disambiguated above (#1566).
     callable_nids = {n["id"] for n in all_nodes if n.get("_callable")}
+    # The Go extractor represents functions/methods through their ``()`` label
+    # but predates the generic ``_callable`` marker.  Keep its local-import
+    # resolver strict nevertheless: types and fields must never satisfy a
+    # package-qualified function call merely because their names coincide.
+    go_callable_nids = {
+        n["id"] for n in all_nodes
+        if str(n.get("source_file", "")).endswith(".go")
+        and str(n.get("label", "")).endswith("()")
+    }
+    go_type_nids = {
+        n["id"] for n in all_nodes
+        if str(n.get("source_file", "")).endswith(".go")
+        and not str(n.get("label", "")).endswith(".go")
+        and not str(n.get("label", "")).endswith("()")
+    }
     # Class defs are callable only via their constructor; they are frequently passed
     # as descriptive values (`select(Model)`, exception tuples), not invoked. Exclude
     # them from the indirect_call guard below to avoid false edges (#2137).
@@ -5135,7 +5231,7 @@ def extract(
     for e in all_edges:
         if e.get("relation") == "imports":
             file_to_symbol_imports.setdefault(e["source"], set()).add(e["target"])
-        elif e.get("relation") == "imports_from":
+        elif e.get("relation") in ("imports_from", "dynamic_import"):
             file_to_module_imports.setdefault(e["source"], set()).add(e["target"])
 
     # Map each node back to its containing file node id so we can ask
@@ -5176,6 +5272,10 @@ def extract(
         nid_to_file_nid[n["id"]] = _file_node_id(sf_rel)
 
     existing_pairs = {(e["source"], e["target"]) for e in all_edges}
+    existing_relation_pairs = {
+        (e["source"], e["target"], str(e.get("relation") or "uses"))
+        for e in all_edges
+    }
     # Call-like pairs only, for the indirect_call dedup: an `imports` edge from a
     # file to the symbol it imports is EXPECTED and must not suppress an
     # indirect_call to that same symbol (JS/TS named imports create such an edge).
@@ -5187,6 +5287,81 @@ def extract(
     # file is real ONLY if the caller imported it. So a cross-file call from one
     # of these files with no import evidence is gated below (#1659).
     _JS_TS_CALL_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+
+    # Go selectors carry package namespace information that bare-name resolution
+    # must never discard.  ``context.WithTimeout`` is not a call to any local
+    # ``WithTimeout`` method.  Resolve only calls into this module, scoped by the
+    # exact imported package directory; external and stdlib calls intentionally
+    # remain outside the project graph.
+    go_module_path = ""
+    try:
+        for line in (root / "go.mod").read_text(encoding="utf-8").splitlines():
+            if line.startswith("module "):
+                go_module_path = line.split(None, 1)[1].strip()
+                break
+    except OSError:
+        pass
+
+    def _go_source_dir(source_file: object) -> str:
+        try:
+            path = Path(str(source_file))
+            relative = path.relative_to(root) if path.is_absolute() else path
+            return relative.parent.as_posix().strip(".")
+        except ValueError:
+            return ""
+
+    def _resolve_go_import_call(raw_call: dict[str, Any]) -> str | None:
+        import_path = str(raw_call.get("import_path", ""))
+        if not go_module_path or not import_path.startswith(go_module_path + "/"):
+            return None
+        package_dir = import_path[len(go_module_path) + 1:].rstrip("/")
+        candidates = [
+            candidate for candidate in global_label_to_nids.get(str(raw_call.get("callee", "")), [])
+            if candidate in go_callable_nids
+            and (nid_to_project_dir.get(candidate) or _go_source_dir(nid_to_source_file.get(candidate, "")))
+            == package_dir
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _resolve_go_import_type(raw_type_ref: dict[str, Any]) -> str | None:
+        import_path = str(raw_type_ref.get("import_path", ""))
+        if not go_module_path or not import_path.startswith(go_module_path + "/"):
+            return None
+        package_dir = import_path[len(go_module_path) + 1:].rstrip("/")
+        candidates = [
+            candidate for candidate in global_label_to_nids.get(str(raw_type_ref.get("type_name", "")), [])
+            if candidate in go_type_nids
+            and (nid_to_project_dir.get(candidate) or _go_source_dir(nid_to_source_file.get(candidate, "")))
+            == package_dir
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    # Type references use the same import proof as qualified function calls.
+    # ``jsonrpc.JSONRPCError`` is a dependency on the exact imported local
+    # package, while ``http.Client`` remains an intentionally unresolved
+    # external type rather than becoming a random project-local ``Client``.
+    for raw_type_ref in all_raw_type_refs:
+        target = _resolve_go_import_type(raw_type_ref)
+        source = raw_type_ref["source_nid"]
+        if target is None or target == source or (source, target) in existing_pairs:
+            continue
+        existing_pairs.add((source, target))
+        edge = {
+            "source": source,
+            "target": target,
+            "relation": raw_type_ref.get("relation", "references"),
+            "confidence": "EXTRACTED",
+            "confidence_score": 1.0,
+            "resolution": "go_import_type",
+            "import_path": raw_type_ref.get("import_path", ""),
+            "source_file": raw_type_ref.get("source_file", ""),
+            "source_location": raw_type_ref.get("source_location"),
+            "weight": 1.0,
+        }
+        if raw_type_ref.get("context"):
+            edge["context"] = raw_type_ref["context"]
+        all_edges.append(edge)
+
     for rc in all_raw_calls:
         callee = rc.get("callee", "")
         if not callee:
@@ -5210,6 +5385,27 @@ def extract(
         # to external commands that merely share a name with a function elsewhere
         # in the corpus — exactly what #2141 must not do.
         if rc.get("language") == "bash":
+            continue
+        if rc.get("language") == "go" and rc.get("package_qualified"):
+            target = _resolve_go_import_call(rc)
+            caller = rc["caller_nid"]
+            if target is not None and target != caller and (caller, target) not in existing_pairs:
+                existing_pairs.add((caller, target))
+                all_edges.append({
+                    "source": caller,
+                    "target": target,
+                    "relation": "calls",
+                    "context": "call",
+                    "confidence": "EXTRACTED",
+                    "confidence_score": 1.0,
+                    "resolution": "go_import",
+                    "import_path": rc.get("import_path", ""),
+                    "source_file": rc.get("source_file", ""),
+                    "source_location": rc.get("source_location"),
+                    "weight": 1.0,
+                })
+            # A package-qualified Go call has been resolved precisely or is
+            # external.  It must never fall through to a corpus-wide name match.
             continue
         # Exact-case match first (case is semantic). Fold only when the CALLING
         # file's language is case-insensitive, and only against the folded index of
@@ -5336,12 +5532,34 @@ def extract(
         # (INFERRED, callable-target-gated) and independent of import evidence.
         if not has_import_evidence and str(rc.get("source_file", "")).endswith(_JS_TS_CALL_SUFFIXES):
             continue
-        if tgt != caller and (caller, tgt) not in existing_pairs:
+        resolved_relation = str(rc.get("relation", "calls"))
+        # An import proves availability, not execution/rendering.  Keep the
+        # historic pair-level deduplication for ordinary calls, but allow a
+        # semantically distinct relation such as JSX `renders` to coexist with
+        # an import edge.  This preserves the route/entrypoint chain without
+        # inflating duplicate call edges.
+        is_new_relation = (caller, tgt, resolved_relation) not in existing_relation_pairs
+        if tgt != caller and is_new_relation and (
+                resolved_relation != "calls" or (caller, tgt) not in existing_pairs):
+            resolution = "name_guess"
+            if rc.get("language") == "go":
+                # Bare calls are valid only inside the same Go package. Cross-
+                # directory Go calls require an import qualifier and were handled
+                # above; accepting them here recreates name-collision edges.
+                if _go_source_dir(rc.get("source_file", "")) != _go_source_dir(
+                    nid_to_source_file.get(tgt, "")
+                ):
+                    continue
+                resolution = "same_go_package"
             existing_pairs.add((caller, tgt))
+            existing_relation_pairs.add((caller, tgt, resolved_relation))
             # Promote to EXTRACTED when there's a direct import edge from the
             # caller's file pointing at either the callee symbol itself or the
             # file the callee lives in.
-            if has_import_evidence:
+            if rc.get("language") == "go":
+                confidence = "EXTRACTED"
+                confidence_score = 1.0
+            elif has_import_evidence:
                 confidence = "EXTRACTED"
                 confidence_score = 1.0
             else:
@@ -5350,14 +5568,182 @@ def extract(
             all_edges.append({
                 "source": caller,
                 "target": tgt,
-                "relation": "calls",
-                "context": "call",
+                "relation": resolved_relation,
+                "context": rc.get("context", "call"),
                 "confidence": confidence,
                 "confidence_score": confidence_score,
+                "resolution": resolution,
                 "source_file": rc.get("source_file", ""),
                 "source_location": rc.get("source_location"),
                 "weight": 1.0,
             })
+
+    # Go dependency-injection wiring: a direct local product of one call
+    # receiving another through ``Register…`` is an exact runtime relationship
+    # once both calls have a concrete return type. The per-file extractor records
+    # the binding and each direct ``return &Concrete{…}``; resolve both only
+    # within the caller's Go package and emit the concrete ``registers``
+    # relationship. No interface conformance or name-based guessing is involved.
+    factory_constructs: dict[str, set[str]] = {}
+    for edge in all_edges:
+        if edge.get("relation") == "constructs":
+            factory_constructs.setdefault(str(edge.get("source", "")), set()).add(
+                str(edge.get("target", ""))
+            )
+
+    def _go_local_factory(factory_name: object, source_file: object) -> str | None:
+        candidates = [
+            candidate for candidate in global_label_to_nids.get(str(factory_name), [])
+            if candidate in go_callable_nids
+            and (nid_to_project_dir.get(candidate) or _go_source_dir(nid_to_source_file.get(candidate, "")))
+            == _go_source_dir(source_file)
+            and not str(nid_to_source_file.get(candidate, "")).endswith("_test.go")
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _go_factory(factory_name: object, source_file: object, import_path: object = "") -> str | None:
+        import_value = str(import_path or "")
+        if not import_value:
+            return _go_local_factory(factory_name, source_file)
+        if not go_module_path or not import_value.startswith(go_module_path + "/"):
+            return None
+        package_dir = import_value[len(go_module_path) + 1:].rstrip("/")
+        candidates = [
+            candidate for candidate in global_label_to_nids.get(str(factory_name), [])
+            if candidate in go_callable_nids
+            and (nid_to_project_dir.get(candidate) or _go_source_dir(nid_to_source_file.get(candidate, "")))
+            == package_dir
+            and not str(nid_to_source_file.get(candidate, "")).endswith("_test.go")
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    # A wrapper may return a local product of another call. Propagate only that
+    # explicit return value; this keeps the concrete type traceable when the
+    # wrapper exposes an interface and is passed onward into another component.
+    for _ in range(4):
+        progressed = False
+        for factory_return in all_raw_factory_returns:
+            if (
+                not isinstance(factory_return, dict)
+                or factory_return.get("language") != "go"
+                or str(factory_return.get("source_file", "")).endswith("_test.go")
+            ):
+                continue
+            wrapper = _go_factory(
+                factory_return.get("factory"), factory_return.get("source_file", "")
+            )
+            delegated = _go_factory(
+                factory_return.get("delegated_factory"), factory_return.get("source_file", ""),
+                factory_return.get("delegated_import_path", ""),
+            )
+            if wrapper is None or delegated is None:
+                continue
+            returned_types = factory_constructs.get(delegated, set())
+            if len(returned_types) != 1:
+                continue
+            returned_type = next(iter(returned_types))
+            if returned_type in factory_constructs.get(wrapper, set()):
+                continue
+            factory_constructs.setdefault(wrapper, set()).add(returned_type)
+            all_edges.append({
+                "source": wrapper,
+                "target": returned_type,
+                "relation": "constructs",
+                "context": "factory_delegation",
+                "confidence": "EXTRACTED",
+                "confidence_score": 1.0,
+                "resolution": "go_factory_return",
+                "source_file": factory_return.get("source_file", ""),
+                "source_location": factory_return.get("source_location"),
+                "weight": 1.0,
+            })
+            progressed = True
+        if not progressed:
+            break
+
+    existing_relation_triplets = {
+        (str(edge.get("source", "")), str(edge.get("target", "")), str(edge.get("relation", "")))
+        for edge in all_edges
+    }
+    for registration in all_raw_registrations:
+        if (
+            not isinstance(registration, dict)
+            or registration.get("language") != "go"
+            or str(registration.get("source_file", "")).endswith("_test.go")
+        ):
+            continue
+        registry_factory = _go_factory(
+            registration.get("registry_factory"), registration.get("source_file", ""),
+            registration.get("registry_import_path", ""),
+        )
+        provider_factory = _go_factory(
+            registration.get("registered_factory"), registration.get("source_file", ""),
+            registration.get("registered_import_path", ""),
+        )
+        if registry_factory is None or provider_factory is None:
+            continue
+        registry_types = factory_constructs.get(registry_factory, set())
+        provider_types = factory_constructs.get(provider_factory, set())
+        if len(registry_types) != 1 or len(provider_types) != 1:
+            continue
+        registry_type = next(iter(registry_types))
+        provider_type = next(iter(provider_types))
+        triplet = (registry_type, provider_type, "registers")
+        if registry_type == provider_type or triplet in existing_relation_triplets:
+            continue
+        existing_relation_triplets.add(triplet)
+        all_edges.append({
+            "source": registry_type,
+            "target": provider_type,
+            "relation": "registers",
+            "context": "factory_registration",
+            "confidence": "EXTRACTED",
+            "confidence_score": 1.0,
+            "resolution": "go_registration_factory",
+            "source_file": registration.get("source_file", ""),
+            "source_location": registration.get("source_location"),
+            "weight": 1.0,
+        })
+
+    for injection in all_raw_factory_injections:
+        if (
+            not isinstance(injection, dict)
+            or injection.get("language") != "go"
+            or str(injection.get("source_file", "")).endswith("_test.go")
+        ):
+            continue
+        consumer_factory = _go_factory(
+            injection.get("consumer_factory"), injection.get("source_file", ""),
+            injection.get("consumer_import_path", ""),
+        )
+        dependency_factory = _go_factory(
+            injection.get("dependency_factory"), injection.get("source_file", ""),
+            injection.get("dependency_import_path", ""),
+        )
+        if consumer_factory is None or dependency_factory is None:
+            continue
+        consumer_types = factory_constructs.get(consumer_factory, set())
+        dependency_types = factory_constructs.get(dependency_factory, set())
+        if len(consumer_types) != 1 or len(dependency_types) != 1:
+            continue
+        consumer_type = next(iter(consumer_types))
+        dependency_type = next(iter(dependency_types))
+        triplet = (consumer_type, dependency_type, "uses")
+        if consumer_type == dependency_type or triplet in existing_relation_triplets:
+            continue
+        existing_relation_triplets.add(triplet)
+        all_edges.append({
+            "source": consumer_type,
+            "target": dependency_type,
+            "relation": "uses",
+            "context": "factory_injection",
+            "confidence": "EXTRACTED",
+            "confidence_score": 1.0,
+            "resolution": "go_factory_injection",
+            "source_file": injection.get("source_file", ""),
+            "source_location": injection.get("source_location"),
+            "weight": 1.0,
+        })
 
     # Cross-file, language-specific member-call resolution. Runs after the shared
     # call pass so node ids/caller_nids are final; each pass is additive (only the
@@ -5441,6 +5827,7 @@ def extract(
     # cache keeps its own copy, which is what the colliding-id pass reads on a cache hit.
     for n in all_nodes:
         n.pop("origin_file", None)
+        n.pop("_qualified_ref", None)  # extractor-only namespace safety marker
         n.pop("_callable", None)  # internal indirect_call marker — never ships to graph.json
         n.pop("_callable_class", None)  # internal #2137 marker — never ships to graph.json
 

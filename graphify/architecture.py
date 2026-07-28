@@ -1,0 +1,1678 @@
+"""C4 architecture projection and conformance checks for Graphify.
+
+The generic Graphify graph is deliberately a graph of observed facts: symbols,
+files and their relationships.  This module adds a separate, versioned C4
+projection.  Keeping it separate means architecture declarations never pollute
+generic queries, community detection, or the on-disk ``graph.json`` contract.
+"""
+
+from __future__ import annotations
+
+from collections import Counter, defaultdict, deque
+from fnmatch import fnmatch
+import json
+from pathlib import Path
+import re
+import sys
+from typing import Any, Iterable
+
+from graphify.paths import write_json_atomic, write_text_atomic
+
+
+SCHEMA = "graphify.architecture/v1"
+DIFF_SCHEMA = "graphify.architecture-diff/v1"
+C4_TYPES = {
+    "person",
+    "software_system",
+    "external_system",
+    "container",
+    "component",
+    "code",
+    "datastore",
+}
+LEVELS = ("context", "container", "component", "code")
+LEVEL_TYPES = {
+    "context": {"person", "software_system", "external_system"},
+    "container": {"container", "datastore"},
+    "component": {"component"},
+    "code": {"code"},
+}
+TRUSTED_RESOLUTIONS = frozenset({"same_file", "same_go_package", "go_import", "go_import_type"})
+ARCHITECTURE_TEXT_FIELDS = ("responsibility", "owner", "trust_boundary", "criticality")
+ARCHITECTURE_LIST_FIELDS = ("data_access", "public_contracts")
+ARCHITECTURE_METADATA_FIELDS = ARCHITECTURE_TEXT_FIELDS + ARCHITECTURE_LIST_FIELDS
+
+
+def default_model() -> dict[str, Any]:
+    """Return an intentionally small, valid starting point for a C4 contract."""
+    return {
+        "schema": SCHEMA,
+        "scope": {"include": ["**"], "exclude": ["graphify-out/**"]},
+        "elements": [
+            {
+                "id": "system",
+                "c4_type": "software_system",
+                "name": "System",
+                "source": "declared",
+            }
+        ],
+        "relations": [],
+        "rules": [],
+    }
+
+
+def default_workspace_model(
+    repositories: list[dict[str, str]], system_name: str = "System",
+) -> dict[str, Any]:
+    """Create a portable C4 starter with concrete-symbol component discovery.
+
+    Graphify extracts Java, Kotlin, TypeScript/React, Android and other supported
+    languages into the same fact schema, so the workspace layer intentionally
+    describes repositories and paths rather than technology-specific build tools.
+    The initial component generator deliberately creates no folder-shaped
+    component.  It lets a team select its meaningful implementation roots
+    (handlers, classes, React components, adapters) after review instead of
+    treating a package as an architectural component.
+    """
+    elements: list[dict[str, Any]] = [{
+        "id": "system",
+        "c4_type": "software_system",
+        "name": system_name,
+        "source": "declared",
+    }]
+    includes: list[str] = []
+    for repository in repositories:
+        repository_id = repository["id"]
+        repository_path = _normalise_path(repository["path"]).rstrip("/")
+        container_id = f"container.{repository_id}"
+        elements.extend((
+            {
+                "id": container_id,
+                "c4_type": "container",
+                "parent": "system",
+                "name": repository_id,
+                "description": f"Repository at {repository_path}",
+            },
+        ))
+        includes.append(f"{repository_path}/**")
+    return {
+        "schema": SCHEMA,
+        "repositories": repositories,
+        "scope": {
+            "include": includes,
+            "exclude": ["**/graphify-out/**", "**/node_modules/**"],
+        },
+        "elements": elements,
+        "component_generators": [],
+        "relations": [],
+        "rules": [],
+    }
+
+
+def load_model(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"architecture model not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"architecture model is not valid JSON: {path}: {exc}") from exc
+    errors = validate_model(data)
+    if errors:
+        raise ValueError("architecture model has errors:\n" + "\n".join(f"  - {e}" for e in errors))
+    return data
+
+
+def _validate_architecture_metadata(item: dict[str, Any], label: str, errors: list[str]) -> None:
+    """Validate optional discussion metadata carried by C4 elements and generators."""
+    for field in ARCHITECTURE_TEXT_FIELDS:
+        if field in item and (not isinstance(item[field], str) or not item[field].strip()):
+            errors.append(f"{label} {field} must be a non-empty string")
+    for field in ARCHITECTURE_LIST_FIELDS:
+        if field not in item:
+            continue
+        value = item[field]
+        if not isinstance(value, list) or any(not isinstance(entry, str) or not entry.strip() for entry in value):
+            errors.append(f"{label} {field} must be a list of non-empty strings")
+
+
+def validate_model(model: object) -> list[str]:
+    """Validate the declarative C4 model without depending on a graph build."""
+    if not isinstance(model, dict):
+        return ["model must be a JSON object"]
+    errors: list[str] = []
+    if model.get("schema") != SCHEMA:
+        errors.append(f"schema must be '{SCHEMA}'")
+
+    elements = model.get("elements")
+    if not isinstance(elements, list) or not elements:
+        errors.append("elements must be a non-empty list")
+        elements = []
+    ids: set[str] = set()
+    by_id: dict[str, dict[str, Any]] = {}
+    for index, element in enumerate(elements):
+        if not isinstance(element, dict):
+            errors.append(f"element {index} must be an object")
+            continue
+        element_id = element.get("id")
+        if not isinstance(element_id, str) or not element_id:
+            errors.append(f"element {index} has invalid id")
+            continue
+        if element_id in ids:
+            errors.append(f"duplicate element id '{element_id}'")
+        ids.add(element_id)
+        by_id[element_id] = element
+        if element.get("c4_type") not in C4_TYPES:
+            errors.append(f"element '{element_id}' has invalid c4_type '{element.get('c4_type')}'")
+        if not isinstance(element.get("name"), str) or not element["name"].strip():
+            errors.append(f"element '{element_id}' needs a non-empty name")
+        _validate_architecture_metadata(element, f"element '{element_id}'", errors)
+        implementation = element.get("implementation", [])
+        if not isinstance(implementation, list):
+            errors.append(f"element '{element_id}' implementation must be a list")
+        else:
+            for selector_index, selector in enumerate(implementation):
+                if not isinstance(selector, dict):
+                    errors.append(f"element '{element_id}' implementation {selector_index} must be an object")
+                elif not any(
+                    key in selector
+                    for key in (
+                        "path_prefix", "path_glob", "source_file", "source_file_regex", "node_id", "label",
+                        "label_regex", "metadata",
+                    )
+                ):
+                    errors.append(
+                        f"element '{element_id}' implementation {selector_index} needs "
+                        "path_prefix, path_glob, source_file, source_file_regex, node_id, label, label_regex, or metadata"
+                    )
+                elif "label_regex" in selector or "source_file_regex" in selector:
+                    try:
+                        re.compile(str(selector.get("label_regex", selector.get("source_file_regex"))))
+                    except re.error as exc:
+                        errors.append(
+                            f"element '{element_id}' implementation {selector_index} has invalid regex: {exc}"
+                        )
+                elif "metadata" in selector and not isinstance(selector["metadata"], dict):
+                    errors.append(f"element '{element_id}' implementation {selector_index} metadata must be an object")
+
+    for element_id, element in by_id.items():
+        parent = element.get("parent")
+        if parent is not None and parent not in ids:
+            errors.append(f"element '{element_id}' parent '{parent}' does not exist")
+        if parent == element_id:
+            errors.append(f"element '{element_id}' cannot be its own parent")
+
+    generators = model.get("component_generators", [])
+    if not isinstance(generators, list):
+        errors.append("component_generators must be a list")
+        generators = []
+    for index, generator in enumerate(generators):
+        if not isinstance(generator, dict):
+            errors.append(f"component generator {index} must be an object")
+            continue
+        prefix = generator.get("id_prefix")
+        if not isinstance(prefix, str) or not prefix.strip():
+            errors.append(f"component generator {index} needs a non-empty id_prefix")
+        parent = generator.get("parent")
+        if not isinstance(parent, str) or parent not in by_id:
+            errors.append(f"component generator {index} parent must reference an element")
+        elif by_id[parent].get("c4_type") != "container":
+            errors.append(f"component generator {index} parent must be a container")
+        selector = generator.get("selector")
+        if not isinstance(selector, dict):
+            errors.append(f"component generator {index} needs a selector object")
+        elif not any(
+            key in selector
+            for key in (
+                "path_prefix", "path_glob", "source_file", "source_file_regex", "node_id", "label",
+                "label_regex", "metadata",
+            )
+        ):
+            errors.append(f"component generator {index} selector needs a node, path, or label matcher")
+        elif "label_regex" in selector or "source_file_regex" in selector:
+            try:
+                re.compile(str(selector.get("label_regex", selector.get("source_file_regex"))))
+            except re.error as exc:
+                errors.append(f"component generator {index} has invalid regex: {exc}")
+        elif "metadata" in selector and not isinstance(selector["metadata"], dict):
+            errors.append(f"component generator {index} selector metadata must be an object")
+        ownership = generator.get("ownership", "file_if_unique")
+        if ownership not in {"file_if_unique", "structural"}:
+            errors.append(
+                f"component generator {index} ownership must be 'file_if_unique' or 'structural'"
+            )
+        root_relation = generator.get("root_relation")
+        if root_relation is not None and (not isinstance(root_relation, str) or not root_relation.strip()):
+            errors.append(f"component generator {index} root_relation must be a non-empty string")
+        if "layer" in generator and (not isinstance(generator["layer"], str) or not generator["layer"].strip()):
+            errors.append(f"component generator {index} layer must be a non-empty string")
+        if "visual" in generator and not isinstance(generator["visual"], dict):
+            errors.append(f"component generator {index} visual must be an object")
+        _validate_architecture_metadata(generator, f"component generator {index}", errors)
+
+    for element_id in by_id:
+        current: str | None = element_id
+        chain: set[str] = set()
+        while current is not None and current in by_id:
+            if current in chain:
+                errors.append(f"parent cycle involving '{element_id}'")
+                break
+            chain.add(current)
+            parent = by_id[current].get("parent")
+            current = parent if isinstance(parent, str) else None
+
+    relations = model.get("relations", [])
+    if not isinstance(relations, list):
+        errors.append("relations must be a list")
+        relations = []
+    for index, relation in enumerate(relations):
+        if not isinstance(relation, dict):
+            errors.append(f"relation {index} must be an object")
+            continue
+        for field in ("source", "target", "kind"):
+            if not isinstance(relation.get(field), str) or not relation[field]:
+                errors.append(f"relation {index} needs a non-empty {field}")
+        for endpoint in ("source", "target"):
+            if isinstance(relation.get(endpoint), str) and relation[endpoint] not in ids:
+                errors.append(f"relation {index} {endpoint} '{relation[endpoint]}' does not exist")
+
+    rules = model.get("rules", [])
+    if not isinstance(rules, list):
+        errors.append("rules must be a list")
+        rules = []
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, dict) or not isinstance(rule.get("deny"), dict):
+            errors.append(f"rule {index} must contain a deny object")
+            continue
+        deny = rule["deny"]
+        if not isinstance(deny.get("source"), str) or deny["source"] not in ids:
+            errors.append(f"rule {index} deny.source must reference an element")
+        target = deny.get("target")
+        target_type = deny.get("target_type")
+        if target is None and target_type is None:
+            errors.append(f"rule {index} needs deny.target or deny.target_type")
+        if target is not None and (not isinstance(target, str) or target not in ids):
+            errors.append(f"rule {index} deny.target must reference an element")
+        if target_type is not None and target_type not in C4_TYPES:
+            errors.append(f"rule {index} deny.target_type is invalid")
+
+    # A workspace model is still a normal C4 contract.  The optional repository
+    # catalogue only tells the workspace command where its observed graphs live;
+    # it deliberately does not change the projection schema or C4 semantics.
+    repositories = model.get("repositories")
+    if repositories is not None:
+        if not isinstance(repositories, list) or not repositories:
+            errors.append("repositories must be a non-empty list when present")
+        else:
+            repository_ids: set[str] = set()
+            for index, repository in enumerate(repositories):
+                if not isinstance(repository, dict):
+                    errors.append(f"repository {index} must be an object")
+                    continue
+                repository_id = repository.get("id")
+                repository_path = repository.get("path")
+                if not isinstance(repository_id, str) or not repository_id.strip():
+                    errors.append(f"repository {index} has invalid id")
+                elif repository_id in repository_ids:
+                    errors.append(f"duplicate repository id '{repository_id}'")
+                else:
+                    repository_ids.add(repository_id)
+                if not isinstance(repository_path, str) or not repository_path.strip():
+                    errors.append(f"repository {index} needs a non-empty path")
+                elif Path(repository_path).is_absolute():
+                    errors.append(f"repository {index} path must be relative to the workspace")
+                graph_path = repository.get("graph")
+                if graph_path is not None and (not isinstance(graph_path, str) or not graph_path.strip()):
+                    errors.append(f"repository {index} graph must be a non-empty relative path")
+    return errors
+
+
+def _links(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    links = raw.get("links") if "links" in raw else raw.get("edges", [])
+    return [link for link in links if isinstance(link, dict)] if isinstance(links, list) else []
+
+
+def _normalise_path(value: object) -> str:
+    return str(value or "").replace("\\", "/").lstrip("./")
+
+
+def _in_scope(path: str, scope: dict[str, Any]) -> bool:
+    include = scope.get("include", ["**"])
+    exclude = scope.get("exclude", [])
+    if not isinstance(include, list):
+        include = ["**"]
+    if not isinstance(exclude, list):
+        exclude = []
+    matched = any(fnmatch(path, str(pattern)) for pattern in include)
+    return matched and not any(fnmatch(path, str(pattern)) for pattern in exclude)
+
+
+def _matches_selector(node_id: str, node: dict[str, Any], selector: dict[str, Any]) -> bool:
+    source_file = _normalise_path(node.get("source_file"))
+    if "node_id" in selector and node_id != selector["node_id"]:
+        return False
+    if "source_file" in selector and source_file != _normalise_path(selector["source_file"]):
+        return False
+    if "source_file_regex" in selector and re.fullmatch(str(selector["source_file_regex"]), source_file) is None:
+        return False
+    if "path_prefix" in selector:
+        prefix = _normalise_path(selector["path_prefix"]).rstrip("/")
+        if not (source_file == prefix or source_file.startswith(prefix + "/")):
+            return False
+    if "path_glob" in selector and not fnmatch(source_file, _normalise_path(selector["path_glob"])):
+        return False
+    if "label" in selector and str(node.get("label", "")) != str(selector["label"]):
+        return False
+    if "label_regex" in selector and re.fullmatch(
+        str(selector["label_regex"]), str(node.get("label", ""))
+    ) is None:
+        return False
+    if "metadata" in selector:
+        node_metadata = node.get("metadata")
+        if not isinstance(node_metadata, dict):
+            return False
+        for key, value in selector["metadata"].items():
+            if node_metadata.get(key) != value:
+                return False
+    return True
+
+
+def _ancestor(element_id: str, elements: dict[str, dict[str, Any]], types: set[str]) -> str | None:
+    current: str | None = element_id
+    visited: set[str] = set()
+    while current is not None and current not in visited:
+        visited.add(current)
+        element = elements.get(current)
+        if element is None:
+            return None
+        if element.get("c4_type") in types:
+            return current
+        parent = element.get("parent")
+        current = parent if isinstance(parent, str) else None
+    return None
+
+
+def _is_descendant(candidate: str, parent: str, elements: dict[str, dict[str, Any]]) -> bool:
+    current: str | None = candidate
+    visited: set[str] = set()
+    while current is not None and current not in visited:
+        if current == parent:
+            return True
+        visited.add(current)
+        element = elements.get(current, {})
+        next_parent = element.get("parent")
+        current = next_parent if isinstance(next_parent, str) else None
+    return False
+
+
+def _code_element_id(node_id: str) -> str:
+    """Keep generated code IDs distinct from declared C4 element IDs."""
+    return f"code:{node_id}"
+
+
+def _generated_component_id(prefix: str, node_id: str) -> str:
+    """Make a portable C4 ID from a graph node without losing its stability."""
+    suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", node_id).strip("-.") or "symbol"
+    return f"{prefix.rstrip('.')}.{suffix}"
+
+
+def _structural_members(root: str, links: list[dict[str, Any]]) -> set[str]:
+    """Return a symbol and its structural children, never its call dependencies."""
+    children: dict[str, set[str]] = defaultdict(set)
+    for link in links:
+        if str(link.get("relation") or "") not in {"contains", "method"}:
+            continue
+        source = str(link.get("_src") or link.get("source") or "")
+        target = str(link.get("_tgt") or link.get("target") or "")
+        if source and target:
+            children[source].add(target)
+    members = {root}
+    queue = deque([root])
+    while queue:
+        current = queue.popleft()
+        for child in sorted(children.get(current, ())):
+            if child not in members:
+                members.add(child)
+                queue.append(child)
+    return members
+
+
+def _generated_components(
+    model: dict[str, Any], scoped_nodes: dict[str, dict[str, Any]], graph: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    """Materialize C4 components from concrete source symbols.
+
+    A generator deliberately selects *symbols*, not folders.  ``file_if_unique``
+    assigns a complete source file to its sole selected root (the normal Go,
+    Java, Kotlin and React convention); ``structural`` assigns only the root and
+    members proven by ``contains``/``method`` edges.  Generated ownership
+    overrides broad declared folder selectors, while competing generators remain
+    an explicit ambiguous mapping.
+    """
+    elements: list[dict[str, Any]] = []
+    ownership: dict[str, list[str]] = defaultdict(list)
+    production_nodes = {
+        node_id: node for node_id, node in scoped_nodes.items() if node.get("file_type") == "code"
+    }
+    for generator in model.get("component_generators", []):
+        if not isinstance(generator, dict):
+            continue
+        selector = generator.get("selector", {})
+        if not isinstance(selector, dict):
+            continue
+        root_relation = generator.get("root_relation")
+        relation_sources = {
+            str(link.get("_src") or link.get("source") or "")
+            for link in _links(graph)
+            if str(link.get("relation") or "") == root_relation
+        }
+        roots = [
+            node_id for node_id, node in sorted(production_nodes.items())
+            if _matches_selector(node_id, node, selector)
+            and (root_relation is None or node_id in relation_sources)
+        ]
+        roots_by_file: dict[str, list[str]] = defaultdict(list)
+        for root in roots:
+            roots_by_file[_normalise_path(production_nodes[root].get("source_file"))].append(root)
+        for root in roots:
+            node = production_nodes[root]
+            component_id = _generated_component_id(str(generator["id_prefix"]), root)
+            name = str(generator.get("name_template", "{label}")).format(
+                label=str(node.get("label") or root),
+                node_id=root,
+                source_file=_normalise_path(node.get("source_file")),
+            )
+            element = {
+                "id": component_id,
+                "c4_type": "component",
+                "parent": generator["parent"],
+                "name": name,
+                "source": "generated",
+                "graph_node_id": root,
+                "source_file": _normalise_path(node.get("source_file")),
+            }
+            if isinstance(generator.get("description_template"), str):
+                element["description"] = generator["description_template"].format(
+                    label=str(node.get("label") or root), node_id=root,
+                    source_file=_normalise_path(node.get("source_file")),
+                )
+            if isinstance(generator.get("layer"), str):
+                element["layer"] = generator["layer"]
+            if isinstance(generator.get("visual"), dict):
+                element["visual"] = dict(generator["visual"])
+            for field in ARCHITECTURE_METADATA_FIELDS:
+                if field in generator:
+                    element[field] = list(generator[field]) if field in ARCHITECTURE_LIST_FIELDS else generator[field]
+            elements.append(element)
+            source_file = _normalise_path(node.get("source_file"))
+            if generator.get("ownership", "file_if_unique") == "file_if_unique" and len(roots_by_file[source_file]) == 1:
+                members = {
+                    node_id for node_id, candidate in production_nodes.items()
+                    if _normalise_path(candidate.get("source_file")) == source_file
+                    # An adjacent declared type is its own architecture root,
+                    # not file-local implementation detail. This is crucial in
+                    # Go where an interface and its struct implementation often
+                    # share one source file (RoleService / roleService).
+                    and (
+                        node_id == root
+                        or not isinstance(candidate.get("metadata"), dict)
+                        or candidate["metadata"].get("kind") not in {
+                            "struct", "interface", "class", "object", "enum",
+                        }
+                    )
+                }
+            else:
+                members = _structural_members(root, _links(graph)) & set(production_nodes)
+            for member in members:
+                ownership[member].append(component_id)
+    return elements, ownership
+
+
+def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
+    """Map observed graph nodes and relationships onto a declared C4 model."""
+    scoped_nodes = {
+        str(node["id"]): node
+        for node in graph.get("nodes", [])
+        if isinstance(node, dict)
+        and isinstance(node.get("id"), str)
+        and _in_scope(_normalise_path(node.get("source_file")), model.get("scope", {}))
+    }
+    generated_elements, generated_ownership = _generated_components(model, scoped_nodes, graph)
+    elements_list = model["elements"] + generated_elements
+    elements = {element["id"]: element for element in elements_list}
+    mappings: dict[str, list[str]] = defaultdict(list)
+    for element in elements_list:
+        for selector in element.get("implementation", []):
+            if not isinstance(selector, dict):
+                continue
+            for node_id, node in scoped_nodes.items():
+                if _matches_selector(node_id, node, selector) and element["id"] not in mappings[node_id]:
+                    mappings[node_id].append(element["id"])
+
+    # A concrete root is more precise than a legacy folder/package selector.
+    # Do retain collisions between two concrete roots: this is a real modelling
+    # ambiguity that needs an explicit selector refinement.
+    for node_id, owners in generated_ownership.items():
+        mappings[node_id] = sorted(set(owners))
+
+    ambiguous = [node_id for node_id, mapped in mappings.items() if len(mapped) > 1]
+    mapped_nodes = {node_id for node_id, mapped in mappings.items() if len(mapped) == 1}
+    production_nodes = {
+        node_id
+        for node_id, node in scoped_nodes.items()
+        if node.get("file_type") == "code"
+    }
+    unmapped = sorted(production_nodes - mapped_nodes)
+
+    code_node_ids = {
+        node_id: _code_element_id(node_id)
+        for node_id in sorted(production_nodes & mapped_nodes)
+    }
+    code_elements = [
+        {
+            "id": code_node_ids[node_id],
+            "c4_type": "code",
+            "parent": mappings[node_id][0],
+            "name": str(node.get("label") or node_id),
+            "source": "observed",
+            "source_file": _normalise_path(node.get("source_file")),
+            "graph_node_id": node_id,
+        }
+        for node_id, node in sorted(scoped_nodes.items())
+        if node_id in code_node_ids
+    ]
+
+    observed: dict[tuple[str, str, str], dict[str, Any]] = {}
+    observed_code: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for link in _links(graph):
+        source = str(link.get("_src") or link.get("source") or "")
+        target = str(link.get("_tgt") or link.get("target") or "")
+        source_mapping = mappings.get(source, [])
+        target_mapping = mappings.get(target, [])
+        if len(source_mapping) != 1 or len(target_mapping) != 1:
+            continue
+        source_component, target_component = source_mapping[0], target_mapping[0]
+        relation = str(link.get("relation") or "uses")
+        evidence = {
+            "source_node": source,
+            "target_node": target,
+            "source_file": link.get("source_file", ""),
+            "source_location": link.get("source_location", ""),
+            "confidence": link.get("confidence", "EXTRACTED"),
+            "resolution": link.get("resolution", "unknown"),
+        }
+        if source in code_node_ids and target in code_node_ids:
+            code_key = (code_node_ids[source], code_node_ids[target], relation)
+            code_item = observed_code.setdefault(
+                code_key,
+                {
+                    "source": code_node_ids[source],
+                    "target": code_node_ids[target],
+                    "kind": relation,
+                    "evidence": [],
+                    "confidence": Counter(),
+                },
+            )
+            code_item["evidence"].append(evidence)
+            code_item["confidence"][str(evidence["confidence"])] += 1
+
+        if source_component == target_component:
+            continue
+        key = (source_component, target_component, relation)
+        item = observed.setdefault(
+            key,
+            {
+                "source": source_component,
+                "target": target_component,
+                "kind": relation,
+                "evidence": [],
+                "confidence": Counter(),
+            },
+        )
+        item["evidence"].append(evidence)
+        item["confidence"][str(evidence["confidence"])] += 1
+
+    observed_relations = []
+    for item in observed.values():
+        item["evidence"].sort(key=lambda evidence: (
+            str(evidence["source_file"]), str(evidence["source_location"]), str(evidence["source_node"])
+        ))
+        item["confidence"] = dict(sorted(item["confidence"].items()))
+        observed_relations.append(item)
+    observed_relations.sort(key=lambda relation: (relation["source"], relation["target"], relation["kind"]))
+
+    observed_code_relations = []
+    for item in observed_code.values():
+        item["evidence"].sort(key=lambda evidence: (
+            str(evidence["source_file"]), str(evidence["source_location"]), str(evidence["source_node"])
+        ))
+        item["confidence"] = dict(sorted(item["confidence"].items()))
+        observed_code_relations.append(item)
+    observed_code_relations.sort(key=lambda relation: (relation["source"], relation["target"], relation["kind"]))
+
+    projection = {
+        "schema": SCHEMA,
+        "elements": elements_list + code_elements,
+        "declared_relations": model.get("relations", []),
+        "rules": model.get("rules", []),
+        "mappings": {node_id: mapped for node_id, mapped in sorted(mappings.items())},
+        "code_node_ids": code_node_ids,
+        "unmapped_code_nodes": unmapped,
+        "ambiguous_code_nodes": sorted(ambiguous),
+        "observed_relations": observed_relations,
+        "observed_code_relations": observed_code_relations,
+    }
+    projection["dependency_resolutions"] = resolve_dependency_rules(projection)
+    return projection
+
+
+def _declared_covers(
+    observed: dict[str, Any],
+    declared: dict[str, Any],
+    elements: dict[str, dict[str, Any]],
+) -> bool:
+    source = str(declared.get("source", ""))
+    target = str(declared.get("target", ""))
+    return _is_descendant(str(observed["source"]), source, elements) and _is_descendant(
+        str(observed["target"]), target, elements
+    )
+
+
+def resolve_dependency_rules(projection: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve every observed C4 dependency against declared relations and deny rules.
+
+    The result is deliberately a compact, machine-readable decision ledger.  It
+    lets a CI job or an architecture-research workflow distinguish an explicit
+    policy violation from a dependency that simply still needs to be declared.
+    A deny rule has precedence over a matching declared relation.
+    """
+    elements = {element["id"]: element for element in projection["elements"]}
+    declared_relations = projection.get("declared_relations", [])
+    resolutions: list[dict[str, Any]] = []
+    for observed in projection["observed_relations"]:
+        matching_rules: list[str] = []
+        for rule in projection.get("rules", []):
+            deny = rule.get("deny", {}) if isinstance(rule, dict) else {}
+            source_matches = _is_descendant(str(observed["source"]), str(deny.get("source", "")), elements)
+            target_matches = (
+                "target" in deny
+                and _is_descendant(str(observed["target"]), str(deny["target"]), elements)
+            ) or (
+                "target_type" in deny
+                and elements.get(str(observed["target"]), {}).get("c4_type") == deny["target_type"]
+            )
+            if source_matches and target_matches:
+                matching_rules.append(str(rule.get("id", "unnamed-rule")))
+        declared = any(_declared_covers(observed, relation, elements) for relation in declared_relations)
+        status = "denied" if matching_rules else "declared" if declared else "undeclared"
+        resolutions.append({
+            "source": observed["source"],
+            "target": observed["target"],
+            "relation": observed["kind"],
+            "status": status,
+            "rules": sorted(matching_rules),
+            "evidence_count": len(observed["evidence"]),
+        })
+    return sorted(
+        resolutions,
+        key=lambda item: (item["source"], item["target"], item["relation"]),
+    )
+
+
+def conformance(projection: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return deterministic architecture findings; only hard facts are errors."""
+    findings: list[dict[str, Any]] = []
+    for node_id in projection["ambiguous_code_nodes"]:
+        findings.append({"severity": "error", "kind": "ambiguous_mapping", "node": node_id})
+    for node_id in projection["unmapped_code_nodes"]:
+        findings.append({"severity": "warning", "kind": "unmapped_code", "node": node_id})
+
+    evidence_by_dependency = {
+        (item["source"], item["target"], item["kind"]): item["evidence"]
+        for item in projection["observed_relations"]
+    }
+    for resolution in resolve_dependency_rules(projection):
+        evidence = evidence_by_dependency[(resolution["source"], resolution["target"], resolution["relation"])]
+        if resolution["status"] == "denied":
+            for rule_id in resolution["rules"]:
+                findings.append(
+                    {
+                        "severity": "error",
+                        "kind": "forbidden_dependency",
+                        "rule": rule_id,
+                        "source": resolution["source"],
+                        "target": resolution["target"],
+                        "evidence": evidence,
+                    }
+                )
+        # A forbidden edge is also useful as an undeclared-dependency finding:
+        # fixing the rule violation does not automatically document the intended
+        # replacement dependency.  Retain the pre-resolution conformance
+        # semantics while exposing the higher-priority denial in the ledger.
+        if resolution["status"] != "declared":
+            findings.append(
+                {
+                    "severity": "warning",
+                    "kind": "undeclared_dependency",
+                    "source": resolution["source"],
+                    "target": resolution["target"],
+                    "relation": resolution["relation"],
+                    "evidence": evidence,
+                }
+            )
+    return findings
+
+
+def suspect_dependencies(projection: dict[str, Any], graph: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return cross-component facts that lack a namespace/import proof.
+
+    The result is deliberately an audit queue, not an architecture violation:
+    older graphs and language extractors may not yet emit resolution provenance.
+    """
+    mappings = projection.get("mappings", {})
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for link in _links(graph):
+        source_node = str(link.get("_src") or link.get("source") or "")
+        target_node = str(link.get("_tgt") or link.get("target") or "")
+        source_mapping = mappings.get(source_node, [])
+        target_mapping = mappings.get(target_node, [])
+        if len(source_mapping) != 1 or len(target_mapping) != 1:
+            continue
+        source, target = source_mapping[0], target_mapping[0]
+        if source == target:
+            continue
+        confidence = str(link.get("confidence", "EXTRACTED"))
+        resolution = str(link.get("resolution", "unknown"))
+        if confidence == "EXTRACTED" and resolution in TRUSTED_RESOLUTIONS:
+            continue
+        finding = grouped.setdefault(
+            (source, target),
+            {
+                "severity": "warning",
+                "kind": "suspect_dependency",
+                "source": source,
+                "target": target,
+                "evidence_count": 0,
+                "reasons": set(),
+                "samples": [],
+            },
+        )
+        finding["evidence_count"] += 1
+        finding["reasons"].add(
+            (str(link.get("relation") or "uses"), confidence, resolution)
+        )
+        if len(finding["samples"]) < 3:
+            finding["samples"].append(
+                {
+                    "source_node": source_node,
+                    "target_node": target_node,
+                    "source_file": link.get("source_file", ""),
+                    "source_location": link.get("source_location", ""),
+                }
+            )
+    findings = []
+    for finding in grouped.values():
+        finding["reasons"] = [
+            {"relation": relation, "confidence": confidence, "resolution": resolution}
+            for relation, confidence, resolution in sorted(finding["reasons"])
+        ]
+        findings.append(finding)
+    return sorted(
+        findings,
+        key=lambda item: (item["source"], item["target"]),
+    )
+
+
+def _element_index(projection: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {element["id"]: element for element in projection["elements"]}
+
+
+def view(projection: dict[str, Any], level: str, focus: str | None = None) -> dict[str, Any]:
+    if level not in LEVEL_TYPES:
+        raise ValueError(f"level must be one of {', '.join(LEVELS)}")
+    elements = _element_index(projection)
+    selected = []
+    for element_id, element in elements.items():
+        if element.get("c4_type") not in LEVEL_TYPES[level]:
+            continue
+        if focus is not None and not _is_descendant(element_id, focus, elements):
+            continue
+        selected.append(element)
+    selected_ids = {element["id"] for element in selected}
+
+    rolled: dict[tuple[str, str, str], dict[str, Any]] = {}
+    relations = projection.get("observed_code_relations", []) if level == "code" else projection["observed_relations"]
+    for relation in relations:
+        source = _ancestor(relation["source"], elements, LEVEL_TYPES[level])
+        target = _ancestor(relation["target"], elements, LEVEL_TYPES[level])
+        if source is None or target is None or source == target:
+            continue
+        if source not in selected_ids or target not in selected_ids:
+            continue
+        key = (source, target, relation["kind"])
+        item = rolled.setdefault(
+            key,
+            {"source": source, "target": target, "kind": relation["kind"], "evidence_count": 0},
+        )
+        item["evidence_count"] += len(relation["evidence"])
+    return {
+        "level": level,
+        "focus": focus,
+        "elements": sorted(selected, key=lambda item: item["id"]),
+        "observed_relations": sorted(rolled.values(), key=lambda item: (item["source"], item["target"], item["kind"])),
+    }
+
+
+def load_projection(path: Path) -> dict[str, Any]:
+    """Load a previously synced C4 projection for historical comparison."""
+    try:
+        projection = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"architecture projection not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"architecture projection is not valid JSON: {path}: {exc}") from exc
+    if not isinstance(projection, dict) or projection.get("schema") != SCHEMA:
+        raise ValueError(f"architecture projection has unsupported schema: {path}")
+    if not isinstance(projection.get("elements"), list):
+        raise ValueError(f"architecture projection has no elements array: {path}")
+    return projection
+
+
+def _element_fingerprint(element: dict[str, Any]) -> str:
+    """Stable structural identity used to detect a changed, non-replaced element."""
+    fields = ("c4_type", "parent", "name", "description", "source_file", "graph_node_id")
+    return json.dumps({field: element.get(field) for field in fields}, sort_keys=True, ensure_ascii=False)
+
+
+def _rolled_diff_relations(projection: dict[str, Any], level: str) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+    """Roll one snapshot to a C4 level before comparing it with another snapshot."""
+    elements = _element_index(projection)
+    source_relations = projection.get("observed_code_relations", []) if level == "code" else projection.get("observed_relations", [])
+    all_relations = [(relation, "observed") for relation in source_relations]
+    if level != "code":
+        all_relations.extend((relation, "declared") for relation in projection.get("declared_relations", []))
+    rolled: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for relation, origin in all_relations:
+        source = _ancestor(str(relation.get("source", "")), elements, LEVEL_TYPES[level])
+        target = _ancestor(str(relation.get("target", "")), elements, LEVEL_TYPES[level])
+        if source is None or target is None or source == target:
+            continue
+        key = (source, target, str(relation.get("kind", "uses")), origin)
+        item = rolled.setdefault(
+            key,
+            {"source": source, "target": target, "kind": key[2], "origin": origin, "evidence_count": 0},
+        )
+        item["evidence_count"] += len(relation.get("evidence", [])) if origin == "observed" else 1
+    return rolled
+
+
+def _code_change_statuses(before: dict[str, Any], after: dict[str, Any]) -> dict[str, str]:
+    before_code = {key: value for key, value in _element_index(before).items() if value.get("c4_type") == "code"}
+    after_code = {key: value for key, value in _element_index(after).items() if value.get("c4_type") == "code"}
+    before_relations = {
+        (item["source"], item["target"], item["kind"]): len(item.get("evidence", []))
+        for item in before.get("observed_code_relations", [])
+    }
+    after_relations = {
+        (item["source"], item["target"], item["kind"]): len(item.get("evidence", []))
+        for item in after.get("observed_code_relations", [])
+    }
+    # An outgoing relation describes a code element's own implementation.  An
+    # incoming relation only means another caller changed, so it must not mark
+    # the target as modified.
+    changed_sources = {
+        key[0]
+        for key in set(before_relations) | set(after_relations)
+        if before_relations.get(key, 0) != after_relations.get(key, 0)
+    }
+    statuses: dict[str, str] = {}
+    for element_id in sorted(set(before_code) | set(after_code)):
+        if element_id not in before_code:
+            statuses[element_id] = "added"
+        elif element_id not in after_code:
+            statuses[element_id] = "removed"
+        elif (
+            _element_fingerprint(before_code[element_id]) != _element_fingerprint(after_code[element_id])
+            or element_id in changed_sources
+        ):
+            statuses[element_id] = "modified"
+        else:
+            statuses[element_id] = "unchanged"
+    return statuses
+
+
+def architecture_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Compare two C4 projections at every C4 level without mixing roll-up stages."""
+    before_elements, after_elements = _element_index(before), _element_index(after)
+    code_status = _code_change_statuses(before, after)
+    descendants: dict[str, Counter[str]] = defaultdict(Counter)
+    for projection, status_source in ((before, "removed"), (after, "added")):
+        elements = _element_index(projection)
+        for code_id, status in code_status.items():
+            if status != status_source or code_id not in elements:
+                continue
+            current: str | None = code_id
+            while current is not None:
+                descendants[current][status] += 1
+                parent = elements.get(current, {}).get("parent")
+                current = parent if isinstance(parent, str) else None
+    for code_id, status in code_status.items():
+        if status != "modified":
+            continue
+        current: str | None = code_id
+        while current is not None:
+            descendants[current][status] += 1
+            parent = after_elements.get(current, {}).get("parent")
+            current = parent if isinstance(parent, str) else None
+
+    levels: dict[str, dict[str, Any]] = {}
+    for level in LEVELS:
+        selected_before = {key: value for key, value in before_elements.items() if value.get("c4_type") in LEVEL_TYPES[level]}
+        selected_after = {key: value for key, value in after_elements.items() if value.get("c4_type") in LEVEL_TYPES[level]}
+        elements: list[dict[str, Any]] = []
+        for element_id in sorted(set(selected_before) | set(selected_after)):
+            old, new = selected_before.get(element_id), selected_after.get(element_id)
+            if old is None:
+                direct_status = "added"
+            elif new is None:
+                direct_status = "removed"
+            elif _element_fingerprint(old) != _element_fingerprint(new):
+                direct_status = "modified"
+            else:
+                direct_status = "unchanged"
+            descendant = {state: descendants[element_id][state] for state in ("added", "removed", "modified")}
+            effective_status = direct_status
+            if effective_status == "unchanged" and any(descendant.values()):
+                # A stable C4 element with changing implementation is modified,
+                # never added or removed.  Direct status alone conveys lifecycle.
+                effective_status = "modified"
+            element = new or old or {}
+            elements.append({
+                "id": element_id,
+                "name": element.get("name", element_id),
+                "c4_type": element.get("c4_type", "unknown"),
+                "parent": element.get("parent"),
+                "status": effective_status,
+                "direct_status": direct_status,
+                "descendant_delta": descendant,
+                "source_file": element.get("source_file", ""),
+            })
+
+        before_relations, after_relations = _rolled_diff_relations(before, level), _rolled_diff_relations(after, level)
+        relation_rows: list[dict[str, Any]] = []
+        for key in sorted(set(before_relations) | set(after_relations)):
+            old, new = before_relations.get(key), after_relations.get(key)
+            if old is None:
+                status = "added"
+            elif new is None:
+                status = "removed"
+            elif old["evidence_count"] != new["evidence_count"]:
+                status = "modified"
+            else:
+                status = "unchanged"
+            relation = new or old or {}
+            relation_rows.append({
+                **relation,
+                "status": status,
+                "before_evidence_count": old["evidence_count"] if old else 0,
+                "after_evidence_count": new["evidence_count"] if new else 0,
+            })
+        levels[level] = {"level": level, "elements": elements, "relations": relation_rows}
+
+    return {
+        "schema": DIFF_SCHEMA,
+        "before": {"elements": len(before_elements), "unmapped_code_nodes": len(before.get("unmapped_code_nodes", []))},
+        "after": {"elements": len(after_elements), "unmapped_code_nodes": len(after.get("unmapped_code_nodes", []))},
+        "levels": levels,
+    }
+
+
+def resolve_architecture_node(projection: dict[str, Any], value: str) -> str | None:
+    elements = _element_index(projection)
+    if value in elements:
+        return value
+    code_node_id = projection.get("code_node_ids", {}).get(value)
+    if isinstance(code_node_id, str) and code_node_id in elements:
+        return code_node_id
+    mapping = projection.get("mappings", {}).get(value, [])
+    if len(mapping) == 1:
+        return mapping[0]
+    matches = [element_id for element_id, element in elements.items() if element.get("name") == value]
+    return matches[0] if len(matches) == 1 else None
+
+
+def up(projection: dict[str, Any], value: str) -> list[dict[str, Any]]:
+    elements = _element_index(projection)
+    element_id = resolve_architecture_node(projection, value)
+    if element_id is None:
+        raise ValueError(f"no unique architecture node for '{value}'")
+    result: list[dict[str, Any]] = []
+    current: str | None = element_id
+    while current is not None:
+        element = elements[current]
+        result.append(element)
+        parent = element.get("parent")
+        current = parent if isinstance(parent, str) else None
+    return result
+
+
+def down(projection: dict[str, Any], value: str, target: str) -> dict[str, Any]:
+    if target not in LEVEL_TYPES:
+        raise ValueError(f"target must be one of {', '.join(LEVELS)}")
+    elements = _element_index(projection)
+    element_id = resolve_architecture_node(projection, value)
+    if element_id is None:
+        raise ValueError(f"no unique architecture node for '{value}'")
+    if target == "code":
+        node_ids = [
+            node_id
+            for node_id, mapped in projection.get("mappings", {}).items()
+            if len(mapped) == 1 and _is_descendant(mapped[0], element_id, elements)
+        ]
+        return {"target": target, "elements": sorted(node_ids)}
+    descendants = [
+        element
+        for candidate, element in elements.items()
+        if candidate != element_id
+        and element.get("c4_type") in LEVEL_TYPES[target]
+        and _is_descendant(candidate, element_id, elements)
+    ]
+    return {"target": target, "elements": sorted(descendants, key=lambda item: item["id"])}
+
+
+def impact(projection: dict[str, Any], graph: dict[str, Any], value: str, depth: int = 2) -> dict[str, Any]:
+    """Reverse-walk factual edges and roll impacted code back to C4 components."""
+    mappings = projection.get("mappings", {})
+    node_ids = {str(node.get("id")) for node in graph.get("nodes", []) if isinstance(node, dict)}
+    seed = value if value in node_ids else None
+    if seed is None:
+        source_matches = [
+            str(node.get("id"))
+            for node in graph.get("nodes", [])
+            if isinstance(node, dict) and _normalise_path(node.get("source_file")) == _normalise_path(value)
+        ]
+        seed = source_matches[0] if len(source_matches) == 1 else None
+    if seed is None:
+        raise ValueError(f"no unique graph node for '{value}'")
+    incoming: dict[str, list[str]] = defaultdict(list)
+    for link in _links(graph):
+        source = str(link.get("_src") or link.get("source") or "")
+        target = str(link.get("_tgt") or link.get("target") or "")
+        incoming[target].append(source)
+    queue: deque[tuple[str, int]] = deque([(seed, 0)])
+    seen = {seed}
+    impacted: set[str] = set()
+    while queue:
+        current, current_depth = queue.popleft()
+        if current_depth >= depth:
+            continue
+        for caller in incoming.get(current, []):
+            if caller in seen:
+                continue
+            seen.add(caller)
+            queue.append((caller, current_depth + 1))
+            mapped = mappings.get(caller, [])
+            if len(mapped) == 1:
+                impacted.add(mapped[0])
+    return {"seed": seed, "depth": depth, "components": sorted(impacted)}
+
+
+def load_graph(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"graph not found: {path}; run 'graphify extract' first") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"graph is not valid JSON: {path}: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
+        raise ValueError(f"graph has no nodes array: {path}")
+    return data
+
+
+def _workspace_graph_path(workspace_root: Path, repository: dict[str, Any]) -> Path:
+    """Resolve one repository graph without permitting a workspace escape."""
+    repository_path = Path(str(repository["path"]))
+    graph_path = Path(str(repository.get("graph", "graphify-out/graph.json")))
+    if graph_path.is_absolute():
+        raise ValueError(f"repository '{repository['id']}' graph must be relative to its path")
+    root = workspace_root.resolve()
+    resolved = (root / repository_path / graph_path).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"repository '{repository['id']}' graph escapes the workspace") from exc
+    return resolved
+
+
+def init_workspace_model(
+    path: Path,
+    repositories: list[dict[str, str]],
+    system_name: str = "System",
+) -> None:
+    """Write a generic, repository-relative workspace C4 starter once."""
+    if path.exists():
+        raise ValueError(f"refusing to overwrite existing workspace architecture model: {path}")
+    model = default_workspace_model(repositories, system_name)
+    errors = validate_model(model)
+    if errors:
+        raise ValueError("generated workspace architecture model has errors:\n" + "\n".join(errors))
+    write_text_atomic(path, json.dumps(model, indent=2, ensure_ascii=False) + "\n")
+
+
+def compose_workspace_graph(model: dict[str, Any], workspace_root: Path) -> dict[str, Any]:
+    """Merge repository facts into one namespaced graph for a C4 projection.
+
+    Node IDs and source paths receive stable repository namespaces.  This avoids
+    collisions between independently extracted projects while preserving the
+    original evidence fields needed by conformance, impact and the Code view.
+    No cross-repository implementation edge is inferred here: integration
+    relationships remain declared contracts until a dedicated extractor proves
+    them.
+    """
+    repositories = model.get("repositories")
+    if not isinstance(repositories, list) or not repositories:
+        raise ValueError("workspace architecture model needs a non-empty repositories list")
+
+    nodes: list[dict[str, Any]] = []
+    links: list[dict[str, Any]] = []
+    repository_summaries: list[dict[str, Any]] = []
+    for repository in repositories:
+        repository_id = str(repository["id"])
+        repository_path = _normalise_path(repository["path"]).rstrip("/")
+        repository_root = (workspace_root.resolve() / repository_path).resolve()
+        graph_path = _workspace_graph_path(workspace_root, repository)
+        graph = load_graph(graph_path)
+        local_nodes = {
+            str(node.get("id")): node
+            for node in graph.get("nodes", [])
+            if isinstance(node, dict) and isinstance(node.get("id"), str)
+        }
+
+        def namespace_node_id(node_id: object) -> str:
+            return f"{repository_id}::{node_id}"
+
+        def namespace_source_file(value: object) -> str:
+            raw_path = Path(str(value or ""))
+            if raw_path.is_absolute():
+                try:
+                    source_file = raw_path.resolve().relative_to(repository_root).as_posix()
+                except ValueError as exc:
+                    raise ValueError(
+                        f"repository '{repository_id}' graph has source_file outside its repository: {value}"
+                    ) from exc
+            else:
+                source_file = _normalise_path(value)
+            return f"{repository_path}/{source_file}" if source_file else repository_path
+
+        for node_id, node in sorted(local_nodes.items()):
+            copied = dict(node)
+            copied["id"] = namespace_node_id(node_id)
+            copied["source_file"] = namespace_source_file(node.get("source_file"))
+            copied["workspace_repository"] = repository_id
+            copied["repository_node_id"] = node_id
+            nodes.append(copied)
+        link_count = 0
+        for link in _links(graph):
+            source = str(link.get("_src") or link.get("source") or "")
+            target = str(link.get("_tgt") or link.get("target") or "")
+            # A raw graph can contain stale endpoints.  Do not create dangling
+            # workspace edges: they would look like evidence across repositories.
+            if source not in local_nodes or target not in local_nodes:
+                continue
+            copied = dict(link)
+            copied.pop("_src", None)
+            copied.pop("_tgt", None)
+            copied["source"] = namespace_node_id(source)
+            copied["target"] = namespace_node_id(target)
+            if copied.get("source_file"):
+                copied["source_file"] = namespace_source_file(copied["source_file"])
+            copied["workspace_repository"] = repository_id
+            links.append(copied)
+            link_count += 1
+        repository_summaries.append({
+            "id": repository_id,
+            "path": repository_path,
+            # This output is often checked in or copied into CI artifacts.
+            # Persist a workspace-relative reference, never a machine path.
+            "graph": graph_path.relative_to(workspace_root.resolve()).as_posix(),
+            "nodes": len(local_nodes),
+            "links": link_count,
+        })
+    return {
+        "nodes": nodes,
+        "links": links,
+        "workspace_repositories": repository_summaries,
+    }
+
+
+def sync_workspace(
+    model_path: Path,
+    workspace_root: Path,
+    output_path: Path,
+    graph_output_path: Path | None = None,
+) -> dict[str, Any]:
+    """Build and persist a namespaced multi-repository C4 projection."""
+    model = load_model(model_path)
+    graph = compose_workspace_graph(model, workspace_root)
+    if graph_output_path is not None:
+        write_json_atomic(graph_output_path, graph, indent=2, ensure_ascii=False)
+    projection = build_projection(model, graph)
+    projection["workspace_repositories"] = graph["workspace_repositories"]
+    projection["findings"] = conformance(projection)
+    write_json_atomic(output_path, projection, indent=2, ensure_ascii=False)
+    return projection
+
+
+def sync(model_path: Path, graph_path: Path, output_path: Path) -> dict[str, Any]:
+    model = load_model(model_path)
+    graph = load_graph(graph_path)
+    projection = build_projection(model, graph)
+    projection["findings"] = conformance(projection)
+    write_json_atomic(output_path, projection, indent=2, ensure_ascii=False)
+    return projection
+
+
+def init_model(path: Path) -> None:
+    if path.exists():
+        raise ValueError(f"refusing to overwrite existing architecture model: {path}")
+    write_text_atomic(path, json.dumps(default_model(), indent=2, ensure_ascii=False) + "\n")
+
+
+def format_view(data: dict[str, Any]) -> str:
+    lines = [f"Architecture view: {data['level']}"]
+    if data.get("focus"):
+        lines.append(f"Focus: {data['focus']}")
+    lines.append("Elements:")
+    for element in data["elements"]:
+        lines.append(f"- {element['id']} [{element['c4_type']}] {element['name']}")
+    lines.append("Observed relationships:")
+    for relation in data["observed_relations"]:
+        lines.append(
+            f"- {relation['source']} --{relation['kind']}--> {relation['target']} "
+            f"({relation['evidence_count']} evidence)"
+        )
+    return "\n".join(lines)
+
+
+def format_findings(findings: Iterable[dict[str, Any]]) -> str:
+    findings = list(findings)
+    if not findings:
+        return "Architecture conformance: OK"
+    lines = ["Architecture conformance:"]
+    for finding in findings:
+        severity = str(finding.get("severity", "warning")).upper()
+        kind = finding.get("kind", "finding")
+        subject = finding.get("rule") or finding.get("node") or (
+            f"{finding.get('source', '?')} -> {finding.get('target', '?')}"
+        )
+        lines.append(f"- {severity} {kind}: {subject}")
+    return "\n".join(lines)
+
+
+def format_dependency_resolutions(resolutions: Iterable[dict[str, Any]]) -> str:
+    """Render the dependency-rule ledger for people and CI logs."""
+    values = list(resolutions)
+    if not values:
+        return "Dependency rules: no cross-component dependencies"
+    lines = ["Dependency rules:"]
+    for item in values:
+        suffix = f"; rules: {', '.join(item['rules'])}" if item["rules"] else ""
+        lines.append(
+            f"- {item['source']} --{item['relation']}--> {item['target']}: "
+            f"{item['status']} [{item['evidence_count']} evidence{suffix}]"
+        )
+    return "\n".join(lines)
+
+
+def _common_paths(args: list[str]) -> tuple[Path, Path, Path, list[str]]:
+    """Read shared architecture command flags and return unconsumed arguments."""
+    model_path = Path("architecture/graphify.c4.json")
+    graph_path = Path("graphify-out/graph.json")
+    output_path = Path("graphify-out/architecture.json")
+    rest: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ("--model", "--graph", "--out"):
+            if index + 1 >= len(args):
+                raise ValueError(f"{arg} needs a path")
+            value = Path(args[index + 1])
+            if arg == "--model":
+                model_path = value
+            elif arg == "--graph":
+                graph_path = value
+            else:
+                output_path = value
+            index += 2
+        elif arg.startswith("--model="):
+            model_path = Path(arg.split("=", 1)[1]); index += 1
+        elif arg.startswith("--graph="):
+            graph_path = Path(arg.split("=", 1)[1]); index += 1
+        elif arg.startswith("--out="):
+            output_path = Path(arg.split("=", 1)[1]); index += 1
+        else:
+            rest.append(arg); index += 1
+    return model_path, graph_path, output_path, rest
+
+
+def architecture_usage() -> str:
+    return """Usage: graphify architecture <command> [options]
+
+Commands:
+  init       create architecture/graphify.c4.json without overwriting it
+  sync       project graph.json onto the declared C4 model
+  validate   report model/conformance violations (exit 2 on errors)
+  dependencies resolve each observed dependency against declared relations and deny rules
+  audit      list cross-component edges without namespace/import proof
+  view       show one C4 level: --level context|container|component|code
+  html       write an interactive architecture.html browser view
+  diff       compare two synced projections at Context, Container, Component and Code
+  workspace  compose repository graphs declared by a workspace C4 model
+  up <node>  raise a code node or C4 id to its C4 ancestors
+  down <id>  descend via --to component|container|code
+  impact <node-or-file>  reverse-walk dependencies and return C4 components
+
+Common options: --model PATH --graph PATH --out PATH
+
+Diff options: --before PROJECTION --after PROJECTION --out PATH [--html PATH]
+
+Workspace options:
+  workspace init --repo ID=PATH [--repo ID=PATH ...] [--model MODEL] [--system NAME]
+  workspace sync --model MODEL --root WORKSPACE --out PROJECTION [--graph-out GRAPH]
+  workspace html --model MODEL --root WORKSPACE --output HTML [--out PROJECTION] [--graph-out GRAPH]
+""".rstrip()
+
+
+def dispatch_cli(args: list[str]) -> int:
+    """Dispatch ``graphify architecture`` while keeping command parsing testable."""
+    if not args or args[0] in ("-h", "--help"):
+        print(architecture_usage())
+        return 0
+    command = args[0]
+    try:
+        if command == "workspace":
+            if len(args) < 2 or args[1] in ("-h", "--help"):
+                print(architecture_usage())
+                return 0
+            workspace_command = args[1]
+            model_path = Path("architecture/graphify.workspace.c4.json")
+            if workspace_command == "init":
+                repositories: list[dict[str, str]] = []
+                system_name = "System"
+                index = 2
+                while index < len(args):
+                    option = args[index]
+                    if option in ("--model", "--repo", "--system"):
+                        if index + 1 >= len(args):
+                            raise ValueError(f"{option} needs a value")
+                        value = args[index + 1]
+                        if option == "--model":
+                            model_path = Path(value)
+                        elif option == "--system":
+                            system_name = value
+                        else:
+                            repository_id, separator, repository_path = value.partition("=")
+                            if not separator or not repository_id.strip() or not repository_path.strip():
+                                raise ValueError("--repo needs ID=RELATIVE_PATH")
+                            if Path(repository_path).is_absolute():
+                                raise ValueError("--repo path must be relative to the workspace")
+                            safe_id = re.sub(r"[^A-Za-z0-9_-]+", "-", repository_id.strip()).strip("-")
+                            if not safe_id:
+                                raise ValueError("--repo ID must contain letters or digits")
+                            repositories.append({"id": safe_id, "path": _normalise_path(repository_path)})
+                        index += 2
+                    elif option.startswith("--model="):
+                        model_path = Path(option.split("=", 1)[1]); index += 1
+                    elif option.startswith("--system="):
+                        system_name = option.split("=", 1)[1]; index += 1
+                    elif option.startswith("--repo="):
+                        value = option.split("=", 1)[1]
+                        repository_id, separator, repository_path = value.partition("=")
+                        if not separator or not repository_id.strip() or not repository_path.strip():
+                            raise ValueError("--repo needs ID=RELATIVE_PATH")
+                        if Path(repository_path).is_absolute():
+                            raise ValueError("--repo path must be relative to the workspace")
+                        safe_id = re.sub(r"[^A-Za-z0-9_-]+", "-", repository_id.strip()).strip("-")
+                        if not safe_id:
+                            raise ValueError("--repo ID must contain letters or digits")
+                        repositories.append({"id": safe_id, "path": _normalise_path(repository_path)})
+                        index += 1
+                    else:
+                        raise ValueError(f"unknown workspace init option '{option}'")
+                if not repositories:
+                    raise ValueError("workspace init needs at least one --repo ID=RELATIVE_PATH")
+                init_workspace_model(model_path, repositories, system_name)
+                print(f"Created workspace architecture model: {model_path}")
+                return 0
+            workspace_root = Path(".")
+            output_path = Path("architecture/graphify-out/architecture.json")
+            graph_output_path: Path | None = Path("architecture/graphify-out/workspace-graph.json")
+            html_output = Path("architecture/graphify-out/architecture.html")
+            index = 2
+            while index < len(args):
+                option = args[index]
+                if option in ("--model", "--root", "--out", "--graph-out", "--output"):
+                    if index + 1 >= len(args):
+                        raise ValueError(f"{option} needs a path")
+                    value = Path(args[index + 1])
+                    if option == "--model":
+                        model_path = value
+                    elif option == "--root":
+                        workspace_root = value
+                    elif option == "--out":
+                        output_path = value
+                    elif option == "--graph-out":
+                        graph_output_path = value
+                    else:
+                        html_output = value
+                    index += 2
+                elif option.startswith("--model="):
+                    model_path = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--root="):
+                    workspace_root = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--out="):
+                    output_path = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--graph-out="):
+                    graph_output_path = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--output="):
+                    html_output = Path(option.split("=", 1)[1]); index += 1
+                else:
+                    raise ValueError(f"unknown workspace option '{option}'")
+            if workspace_command not in ("sync", "html"):
+                raise ValueError("workspace command must be sync or html")
+            projection = sync_workspace(
+                model_path, workspace_root, output_path,
+                graph_output_path=graph_output_path,
+            )
+            print(
+                f"Workspace architecture projection: {len(projection['elements'])} elements, "
+                f"{len(projection['observed_relations'])} observed relationships, "
+                f"{len(projection['workspace_repositories'])} repositories\n"
+                f"Wrote {output_path}"
+            )
+            if workspace_command == "html":
+                from graphify.architecture_html import write_architecture_html
+
+                write_architecture_html(projection, html_output)
+                print(f"Wrote interactive workspace architecture view: {html_output}")
+            return 0
+
+        if command == "diff":
+            before_path: Path | None = None
+            after_path: Path | None = None
+            output_path = Path("graphify-out/architecture-diff.json")
+            html_output: Path | None = None
+            index = 1
+            while index < len(args):
+                option = args[index]
+                if option in ("--before", "--after", "--out", "--html"):
+                    if index + 1 >= len(args):
+                        raise ValueError(f"{option} needs a path")
+                    value = Path(args[index + 1])
+                    if option == "--before":
+                        before_path = value
+                    elif option == "--after":
+                        after_path = value
+                    elif option == "--out":
+                        output_path = value
+                    else:
+                        html_output = value
+                    index += 2
+                elif option.startswith("--before="):
+                    before_path = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--after="):
+                    after_path = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--out="):
+                    output_path = Path(option.split("=", 1)[1]); index += 1
+                elif option.startswith("--html="):
+                    html_output = Path(option.split("=", 1)[1]); index += 1
+                else:
+                    raise ValueError(f"unknown diff option '{option}'")
+            if before_path is None or after_path is None:
+                raise ValueError("diff needs --before PROJECTION and --after PROJECTION")
+            result = architecture_diff(load_projection(before_path), load_projection(after_path))
+            write_json_atomic(output_path, result, indent=2, ensure_ascii=False)
+            if html_output is not None:
+                from graphify.architecture_diff_html import write_architecture_diff_html
+
+                write_architecture_diff_html(result, html_output)
+            print(f"Wrote architecture diff: {output_path}")
+            if html_output is not None:
+                print(f"Wrote interactive architecture diff: {html_output}")
+            return 0
+
+        model_path, graph_path, output_path, rest = _common_paths(args[1:])
+        if command == "init":
+            if rest:
+                raise ValueError("init accepts only --model")
+            init_model(model_path)
+            print(f"Created architecture model: {model_path}")
+            return 0
+
+        if command == "sync":
+            if rest:
+                raise ValueError("sync accepts only common path options")
+            projection = sync(model_path, graph_path, output_path)
+            print(
+                f"Architecture projection: {len(projection['elements'])} elements, "
+                f"{len(projection['observed_relations'])} observed relationships, "
+                f"{len(projection['findings'])} findings\n"
+                f"Wrote {output_path}"
+            )
+            return 0
+
+        model = load_model(model_path)
+        graph = load_graph(graph_path)
+        projection = build_projection(model, graph)
+        projection["findings"] = conformance(projection)
+
+        if command == "validate":
+            if rest:
+                raise ValueError("validate accepts only common path options")
+            print(format_findings(projection["findings"]))
+            return 2 if any(item["severity"] == "error" for item in projection["findings"]) else 0
+
+        if command == "dependencies":
+            if rest:
+                raise ValueError("dependencies accepts only common path options")
+            print(format_dependency_resolutions(projection["dependency_resolutions"]))
+            return 2 if any(item["status"] == "denied" for item in projection["dependency_resolutions"]) else 0
+
+        if command == "audit":
+            if rest and rest != ["--suspect"]:
+                raise ValueError("audit accepts only --suspect")
+            findings = suspect_dependencies(projection, graph)
+            if not findings:
+                print("Architecture audit: no suspect dependencies")
+                return 0
+            print("Architecture audit: suspect dependencies")
+            for finding in findings:
+                reasons = ", ".join(
+                    f"{item['relation']}; {item['confidence']}; {item['resolution']}"
+                    for item in finding["reasons"]
+                )
+                samples = ", ".join(
+                    f"{item['source_file']}:{item['source_location']}"
+                    for item in finding["samples"]
+                )
+                print(
+                    f"- {finding['source']} -> {finding['target']} "
+                    f"[{finding['evidence_count']} evidence; {reasons}] {samples}"
+                )
+            return 0
+
+        if command == "html":
+            output = Path("graphify-out/architecture.html")
+            if not rest:
+                pass
+            elif len(rest) == 2 and rest[0] == "--output":
+                output = Path(rest[1])
+            elif len(rest) == 1 and rest[0].startswith("--output="):
+                output = Path(rest[0].split("=", 1)[1])
+            else:
+                raise ValueError("html accepts only --output PATH")
+            from graphify.architecture_html import write_architecture_html
+
+            write_architecture_html(projection, output)
+            print(f"Wrote interactive architecture view: {output}")
+            return 0
+
+        if command == "view":
+            level = "container"
+            focus: str | None = None
+            index = 0
+            while index < len(rest):
+                if rest[index] == "--level" and index + 1 < len(rest):
+                    level = rest[index + 1]; index += 2
+                elif rest[index].startswith("--level="):
+                    level = rest[index].split("=", 1)[1]; index += 1
+                elif rest[index] == "--focus" and index + 1 < len(rest):
+                    focus = rest[index + 1]; index += 2
+                elif rest[index].startswith("--focus="):
+                    focus = rest[index].split("=", 1)[1]; index += 1
+                else:
+                    raise ValueError(f"unknown view option '{rest[index]}'")
+            print(format_view(view(projection, level, focus)))
+            return 0
+
+        if command == "up":
+            if len(rest) != 1:
+                raise ValueError("up needs exactly one code node or C4 id")
+            for element in up(projection, rest[0]):
+                print(f"{element['id']} [{element['c4_type']}] {element['name']}")
+            return 0
+
+        if command == "down":
+            if not rest:
+                raise ValueError("down needs a C4 id")
+            value = rest[0]
+            target = "component"
+            options = rest[1:]
+            if len(options) == 2 and options[0] == "--to":
+                target = options[1]
+            elif len(options) == 1 and options[0].startswith("--to="):
+                target = options[0].split("=", 1)[1]
+            elif options:
+                raise ValueError("down accepts only --to LEVEL")
+            result = down(projection, value, target)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
+
+        if command == "impact":
+            if not rest:
+                raise ValueError("impact needs a graph node id or source-file path")
+            value = rest[0]
+            depth = 2
+            options = rest[1:]
+            if len(options) == 2 and options[0] == "--depth":
+                depth = int(options[1])
+            elif len(options) == 1 and options[0].startswith("--depth="):
+                depth = int(options[0].split("=", 1)[1])
+            elif options:
+                raise ValueError("impact accepts only --depth N")
+            print(json.dumps(impact(projection, graph, value, depth), indent=2, ensure_ascii=False))
+            return 0
+
+        raise ValueError(f"unknown architecture command '{command}'")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1

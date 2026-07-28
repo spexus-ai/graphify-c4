@@ -1,0 +1,644 @@
+from __future__ import annotations
+
+import json
+
+import graphify.__main__ as mainmod
+from graphify.architecture import (
+    architecture_diff,
+    build_projection,
+    compose_workspace_graph,
+    conformance,
+    format_dependency_resolutions,
+    down,
+    impact,
+    load_model,
+    resolve_dependency_rules,
+    suspect_dependencies,
+    sync_workspace,
+    up,
+    validate_model,
+    view,
+)
+
+
+MODEL = {
+    "schema": "graphify.architecture/v1",
+    "scope": {"include": ["src/**", "infra/**"], "exclude": ["**/*_test.py"]},
+    "elements": [
+        {"id": "system", "c4_type": "software_system", "name": "System"},
+        {"id": "front", "c4_type": "container", "parent": "system", "name": "Frontend"},
+        {"id": "front.ui", "c4_type": "component", "parent": "front", "name": "UI",
+         "implementation": [{"path_prefix": "src/ui"}]},
+        {"id": "database", "c4_type": "datastore", "parent": "system", "name": "Database",
+         "implementation": [{"path_prefix": "infra/db"}]},
+    ],
+    "relations": [],
+    "rules": [
+        {"id": "front-no-db", "deny": {"source": "front", "target_type": "datastore"}},
+    ],
+}
+
+
+GRAPH = {
+    "nodes": [
+        {"id": "ui", "label": "render()", "file_type": "code", "source_file": "src/ui/render.ts"},
+        {"id": "db", "label": "query()", "file_type": "code", "source_file": "infra/db/client.py"},
+        {"id": "unmapped", "label": "orphan()", "file_type": "code", "source_file": "src/orphan.py"},
+        {"id": "test", "label": "test_render", "file_type": "code", "source_file": "src/ui/render_test.py"},
+    ],
+    "links": [
+        {
+            "source": "ui", "target": "db", "relation": "calls", "confidence": "EXTRACTED",
+            "source_file": "src/ui/render.ts", "source_location": "L14",
+            "resolution": "go_import",
+        },
+    ],
+}
+
+
+def test_model_contract_is_valid():
+    assert validate_model(MODEL) == []
+
+
+def test_model_validation_rejects_parent_cycles_and_wrong_collection_types():
+    invalid = {
+        **MODEL,
+        "relations": {},
+        "rules": {},
+        "elements": [
+            {"id": "a", "c4_type": "container", "name": "A", "parent": "b"},
+            {"id": "b", "c4_type": "component", "name": "B", "parent": "a"},
+        ],
+    }
+
+    errors = validate_model(invalid)
+
+    assert any("parent cycle" in error for error in errors)
+    assert "relations must be a list" in errors
+    assert "rules must be a list" in errors
+
+
+def test_component_generator_creates_symbol_components_and_overrides_folder_mapping():
+    model = {
+        "schema": "graphify.architecture/v1",
+        "scope": {"include": ["src/**"]},
+        "elements": [
+            {"id": "system", "c4_type": "software_system", "name": "System"},
+            {"id": "api", "c4_type": "container", "parent": "system", "name": "API"},
+            {"id": "legacy.handlers", "c4_type": "component", "parent": "api", "name": "Handlers",
+             "implementation": [{"path_prefix": "src/handlers"}]},
+        ],
+        "component_generators": [{
+            "id_prefix": "api.handler",
+            "parent": "api",
+            "selector": {"path_prefix": "src/handlers", "label_regex": "^[A-Z][A-Za-z0-9]*Handler$"},
+            "ownership": "file_if_unique",
+        }],
+        "relations": [], "rules": [],
+    }
+    graph = {
+        "nodes": [
+            {"id": "role", "label": "RoleHandler", "file_type": "code", "source_file": "src/handlers/role.go"},
+            {"id": "create", "label": ".Create()", "file_type": "code", "source_file": "src/handlers/role.go"},
+            {"id": "constructor", "label": "NewRoleHandler()", "file_type": "code", "source_file": "src/handlers/role.go"},
+            {"id": "other", "label": "Other", "file_type": "code", "source_file": "src/handlers/other.go"},
+        ],
+        "links": [{"source": "role", "target": "create", "relation": "method"}],
+    }
+
+    assert validate_model(model) == []
+    projection = build_projection(model, graph)
+
+    component_id = "api.handler.role"
+    assert any(item["id"] == component_id and item["name"] == "RoleHandler" for item in projection["elements"])
+    assert projection["mappings"]["role"] == [component_id]
+    assert projection["mappings"]["create"] == [component_id]
+    assert projection["mappings"]["constructor"] == [component_id]
+    assert projection["mappings"]["other"] == ["legacy.handlers"]
+    assert projection["ambiguous_code_nodes"] == []
+
+
+def test_component_generator_can_require_symbol_metadata_and_a_structural_relation():
+    model = {
+        "schema": "graphify.architecture/v1",
+        "scope": {"include": ["src/**"]},
+        "elements": [
+            {"id": "system", "c4_type": "software_system", "name": "System"},
+            {"id": "api", "c4_type": "container", "parent": "system", "name": "API"},
+        ],
+        "component_generators": [{
+            "id_prefix": "api.service",
+            "parent": "api",
+            "layer": "Application Service",
+            "visual": {"shape": "square", "color": "#0072B2"},
+            "root_relation": "method",
+            "selector": {"metadata": {"language": "go", "kind": "struct"}},
+        }],
+        "relations": [], "rules": [],
+    }
+    graph = {
+        "nodes": [
+            {"id": "contract", "label": "RoleService", "file_type": "code", "source_file": "src/role.go",
+             "metadata": {"language": "go", "kind": "interface"}},
+            {"id": "implementation", "label": "roleService", "file_type": "code", "source_file": "src/role.go",
+             "metadata": {"language": "go", "kind": "struct"}},
+            {"id": "method", "label": ".Create()", "file_type": "code", "source_file": "src/role.go"},
+        ],
+        "links": [{"source": "implementation", "target": "method", "relation": "method"}],
+    }
+
+    projection = build_projection(model, graph)
+
+    generated = next(item for item in projection["elements"] if item["id"] == "api.service.implementation")
+    assert generated["name"] == "roleService"
+    assert generated["layer"] == "Application Service"
+    assert generated["visual"] == {"shape": "square", "color": "#0072B2"}
+    assert "contract" not in projection["mappings"]
+
+
+def test_component_metadata_is_validated_and_propagated_from_generators():
+    model = {
+        "schema": "graphify.architecture/v1",
+        "scope": {"include": ["src/**"]},
+        "elements": [
+            {"id": "system", "c4_type": "software_system", "name": "System"},
+            {"id": "api", "c4_type": "container", "parent": "system", "name": "API"},
+        ],
+        "component_generators": [{
+            "id_prefix": "api.service",
+            "parent": "api",
+            "selector": {"metadata": {"language": "go", "kind": "struct"}},
+            "responsibility": "Apply business policy",
+            "owner": "Core team",
+            "trust_boundary": "Authenticated request",
+            "data_access": ["project data"],
+            "public_contracts": ["Service API"],
+            "criticality": "high",
+        }],
+        "relations": [], "rules": [],
+    }
+    graph = {
+        "nodes": [{
+            "id": "implementation", "label": "roleService", "file_type": "code", "source_file": "src/role.go",
+            "metadata": {"language": "go", "kind": "struct"},
+        }],
+        "links": [],
+    }
+
+    assert validate_model(model) == []
+    projection = build_projection(model, graph)
+    generated = next(item for item in projection["elements"] if item["id"] == "api.service.implementation")
+    assert generated["responsibility"] == "Apply business policy"
+    assert generated["data_access"] == ["project data"]
+    assert generated["public_contracts"] == ["Service API"]
+
+    invalid = {**model, "elements": [{
+        "id": "system", "c4_type": "software_system", "name": "System", "owner": ["not a string"],
+    }]}
+    assert "element 'system' owner must be a non-empty string" in validate_model(invalid)
+
+
+def test_projection_rolls_code_relationships_to_c4_and_retains_evidence():
+    projection = build_projection(MODEL, GRAPH)
+
+    assert projection["mappings"] == {"db": ["database"], "ui": ["front.ui"]}
+    assert projection["unmapped_code_nodes"] == ["unmapped"]
+    assert projection["code_node_ids"] == {"db": "code:db", "ui": "code:ui"}
+    assert [element["id"] for element in projection["elements"] if element["c4_type"] == "code"] == [
+        "code:db", "code:ui"
+    ]
+    assert projection["observed_code_relations"] == [
+        {
+            "source": "code:ui",
+            "target": "code:db",
+            "kind": "calls",
+            "confidence": {"EXTRACTED": 1},
+            "evidence": [{
+                "source_node": "ui", "target_node": "db", "source_file": "src/ui/render.ts",
+                "source_location": "L14", "confidence": "EXTRACTED",
+                "resolution": "go_import",
+            }],
+        }
+    ]
+    assert projection["observed_relations"] == [
+        {
+            "source": "front.ui",
+            "target": "database",
+            "kind": "calls",
+            "confidence": {"EXTRACTED": 1},
+            "evidence": [{
+                "source_node": "ui", "target_node": "db", "source_file": "src/ui/render.ts",
+                "source_location": "L14", "confidence": "EXTRACTED",
+                "resolution": "go_import",
+            }],
+        }
+    ]
+
+
+def test_conformance_reports_forbidden_undeclared_and_unmapped_code():
+    findings = conformance(build_projection(MODEL, GRAPH))
+
+    assert {finding["kind"] for finding in findings} == {
+        "forbidden_dependency", "undeclared_dependency", "unmapped_code",
+    }
+    assert next(finding for finding in findings if finding["kind"] == "forbidden_dependency")["rule"] == "front-no-db"
+
+
+def test_dependency_rules_resolve_observed_edges_into_a_machine_readable_ledger():
+    projection = build_projection(MODEL, GRAPH)
+
+    resolutions = resolve_dependency_rules(projection)
+
+    assert resolutions == [{
+        "source": "front.ui", "target": "database", "relation": "calls", "status": "denied",
+        "rules": ["front-no-db"], "evidence_count": 1,
+    }]
+    assert projection["dependency_resolutions"] == resolutions
+    assert format_dependency_resolutions(resolutions) == (
+        "Dependency rules:\n"
+        "- front.ui --calls--> database: denied [1 evidence; rules: front-no-db]"
+    )
+
+
+def test_dependency_rule_resolution_marks_declared_and_undeclared_edges():
+    model = {**MODEL, "rules": [], "relations": [{"source": "front", "target": "database", "kind": "uses"}]}
+    declared = resolve_dependency_rules(build_projection(model, GRAPH))
+    undeclared = resolve_dependency_rules(build_projection({**model, "relations": []}, GRAPH))
+
+    assert declared[0]["status"] == "declared"
+    assert undeclared[0]["status"] == "undeclared"
+
+
+def test_suspect_dependencies_require_namespace_or_import_proof():
+    graph = {
+        **GRAPH,
+        "links": [{
+            **GRAPH["links"][0],
+            "confidence": "INFERRED",
+            "resolution": "name_guess",
+        }],
+    }
+
+    findings = suspect_dependencies(build_projection(MODEL, graph), graph)
+
+    assert findings == [{
+        "severity": "warning", "kind": "suspect_dependency", "source": "front.ui", "target": "database",
+        "evidence_count": 1,
+        "reasons": [{"relation": "calls", "confidence": "INFERRED", "resolution": "name_guess"}],
+        "samples": [{
+            "source_node": "ui", "target_node": "db", "source_file": "src/ui/render.ts", "source_location": "L14",
+        }],
+    }]
+
+
+def test_go_import_type_evidence_is_not_suspect():
+    graph = {
+        **GRAPH,
+        "links": [{
+            **GRAPH["links"][0],
+            "confidence": "EXTRACTED",
+            "resolution": "go_import_type",
+        }],
+    }
+
+    assert suspect_dependencies(build_projection(MODEL, graph), graph) == []
+
+
+def test_projection_keeps_intra_component_code_relationships():
+    graph = {
+        "nodes": [
+            {"id": "ui", "label": "render()", "file_type": "code", "source_file": "src/ui/render.ts"},
+            {"id": "helper", "label": "helper()", "file_type": "code", "source_file": "src/ui/helper.ts"},
+        ],
+        "links": [{"source": "ui", "target": "helper", "relation": "calls", "confidence": "EXTRACTED"}],
+    }
+
+    projection = build_projection(MODEL, graph)
+
+    assert projection["observed_relations"] == []
+    assert projection["observed_code_relations"] == [{
+        "source": "code:ui", "target": "code:helper", "kind": "calls",
+        "confidence": {"EXTRACTED": 1},
+        "evidence": [{
+            "source_node": "ui", "target_node": "helper", "source_file": "",
+            "source_location": "", "confidence": "EXTRACTED", "resolution": "unknown",
+        }],
+    }]
+
+
+def test_hierarchical_navigation_moves_between_code_component_container_and_context():
+    projection = build_projection(MODEL, GRAPH)
+
+    assert [element["id"] for element in up(projection, "ui")] == ["code:ui", "front.ui", "front", "system"]
+    assert down(projection, "front", "code") == {"target": "code", "elements": ["ui"]}
+    container_view = view(projection, "container")
+    assert [element["id"] for element in container_view["elements"]] == ["database", "front"]
+    assert container_view["observed_relations"] == [
+        {"source": "front", "target": "database", "kind": "calls", "evidence_count": 1}
+    ]
+    code_view = view(projection, "code")
+    assert [element["id"] for element in code_view["elements"]] == ["code:db", "code:ui"]
+    assert code_view["observed_relations"] == [
+        {"source": "code:ui", "target": "code:db", "kind": "calls", "evidence_count": 1}
+    ]
+
+
+def test_architecture_diff_rolls_code_changes_to_every_c4_level():
+    before = build_projection(MODEL, GRAPH)
+    after_graph = {
+        "nodes": [
+            *GRAPH["nodes"],
+            {"id": "new", "label": "newFlow()", "file_type": "code", "source_file": "src/ui/new.ts"},
+        ],
+        "links": [
+            *GRAPH["links"],
+            {"source": "new", "target": "db", "relation": "calls", "confidence": "EXTRACTED"},
+            {"source": "ui", "target": "db", "relation": "calls", "confidence": "EXTRACTED"},
+        ],
+    }
+    after = build_projection(MODEL, after_graph)
+
+    diff = architecture_diff(before, after)
+
+    assert diff["schema"] == "graphify.architecture-diff/v1"
+    assert next(item for item in diff["levels"]["code"]["elements"] if item["id"] == "code:new")["status"] == "added"
+    assert next(item for item in diff["levels"]["code"]["elements"] if item["id"] == "code:ui")["status"] == "modified"
+    component = next(item for item in diff["levels"]["component"]["elements"] if item["id"] == "front.ui")
+    container = next(item for item in diff["levels"]["container"]["elements"] if item["id"] == "front")
+    context = next(item for item in diff["levels"]["context"]["elements"] if item["id"] == "system")
+    assert component["descendant_delta"]["added"] == 1
+    assert component["descendant_delta"]["modified"] == 1
+    assert component["direct_status"] == "unchanged"
+    assert component["status"] == "modified"
+    assert container["descendant_delta"]["added"] == 1
+    assert context["descendant_delta"]["added"] == 1
+    relation = next(item for item in diff["levels"]["container"]["relations"] if item["source"] == "front")
+    assert relation["status"] == "modified"
+
+
+def test_impact_rolls_reverse_code_dependencies_to_components():
+    projection = build_projection(MODEL, GRAPH)
+
+    assert impact(projection, GRAPH, "db") == {"seed": "db", "depth": 2, "components": ["front.ui"]}
+
+
+def test_architecture_sync_cli_writes_sidecar_without_changing_graph(monkeypatch, tmp_path, capsys):
+    model_path = tmp_path / "model.json"
+    graph_path = tmp_path / "graph.json"
+    out_path = tmp_path / "architecture.json"
+    model_path.write_text(json.dumps(MODEL), encoding="utf-8")
+    graph_path.write_text(json.dumps(GRAPH), encoding="utf-8")
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        [
+            "graphify", "architecture", "sync", "--model", str(model_path), "--graph", str(graph_path),
+            "--out", str(out_path),
+        ],
+    )
+
+    mainmod.main()
+
+    assert "Architecture projection:" in capsys.readouterr().out
+    saved = json.loads(out_path.read_text(encoding="utf-8"))
+    assert saved["schema"] == "graphify.architecture/v1"
+    assert saved["observed_relations"][0]["source"] == "front.ui"
+
+
+def test_architecture_dependencies_cli_resolves_the_rule_ledger(monkeypatch, tmp_path, capsys):
+    model_path = tmp_path / "model.json"
+    graph_path = tmp_path / "graph.json"
+    model_path.write_text(json.dumps({**MODEL, "rules": []}), encoding="utf-8")
+    graph_path.write_text(json.dumps(GRAPH), encoding="utf-8")
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv", [
+        "graphify", "architecture", "dependencies", "--model", str(model_path), "--graph", str(graph_path),
+    ])
+
+    mainmod.main()
+
+    assert capsys.readouterr().out == (
+        "Dependency rules:\n"
+        "- front.ui --calls--> database: undeclared [1 evidence]\n"
+    )
+
+
+def test_architecture_html_cli_writes_interactive_c4_view(monkeypatch, tmp_path, capsys):
+    model_path = tmp_path / "model.json"
+    graph_path = tmp_path / "graph.json"
+    html_path = tmp_path / "architecture.html"
+    model_path.write_text(json.dumps(MODEL), encoding="utf-8")
+    graph_path.write_text(json.dumps(GRAPH), encoding="utf-8")
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        [
+            "graphify", "architecture", "html", "--model", str(model_path), "--graph", str(graph_path),
+            "--output", str(html_path),
+        ],
+    )
+
+    mainmod.main()
+
+    assert "interactive architecture view" in capsys.readouterr().out
+    html = html_path.read_text(encoding="utf-8")
+    assert "C4 Architecture" in html
+    assert "front.ui" in html
+    assert "Graphify C4 Architecture" in html
+    assert "vis-network@9.1.6" in html
+    assert "forceAtlas2Based" in html
+    assert "Drag nodes to arrange them" in html
+    assert "observed_code_relations" in html
+    assert "select-all-cb" in html
+    assert "node-filter" in html
+    assert "packagePath" in html
+    assert "cross-package bridges" in html
+    assert "go_import_type" in html
+    assert '<option value="component" selected>Component</option>' in html
+    assert "Highlight keeps the complete graph visible" in html
+    assert "function focusTargets(elements)" in html
+    assert "function updateHighlightState(elements, relations)" in html
+    assert "maxComponentNodes = Number.POSITIVE_INFINITY" in html
+    assert "return payload.elements.filter(item => wanted.has(item.c4_type));" in html
+    assert "Responsibility" in html
+    assert "maxFocusedCodeNodes = 750" in html
+    assert "growConnected" in html
+    assert "function focusNode(id, scale=1.55)" in html
+    assert "duration:650,easingFunction:'easeInOutQuad'" in html
+    assert "row.onclick=event=>{if(event.target===checkbox)return;focusNode(item.id);}" in html
+    assert "entry.onclick=()=>{focusNode(item.id);" in html
+    assert "if(link)focusNode(link.dataset.nid)" in html
+    assert "pinnedNodeId=nodeId;cameraTargetId=nodeId;updateGraph();" in html
+
+
+def test_architecture_diff_cli_writes_all_levels_and_interactive_view(monkeypatch, tmp_path, capsys):
+    before_path = tmp_path / "before.json"
+    after_path = tmp_path / "after.json"
+    out_path = tmp_path / "diff.json"
+    html_path = tmp_path / "diff.html"
+    before_path.write_text(json.dumps(build_projection(MODEL, GRAPH)), encoding="utf-8")
+    after_path.write_text(json.dumps(build_projection(MODEL, {
+        "nodes": [*GRAPH["nodes"], {"id": "new", "label": "newFlow()", "file_type": "code", "source_file": "src/ui/new.ts"}],
+        "links": [*GRAPH["links"], {"source": "new", "target": "db", "relation": "calls", "confidence": "EXTRACTED"}],
+    })), encoding="utf-8")
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv", [
+        "graphify", "architecture", "diff", "--before", str(before_path), "--after", str(after_path),
+        "--out", str(out_path), "--html", str(html_path),
+    ])
+
+    mainmod.main()
+
+    assert "Wrote architecture diff" in capsys.readouterr().out
+    saved = json.loads(out_path.read_text(encoding="utf-8"))
+    assert set(saved["levels"]) == {"context", "container", "component", "code"}
+    html = html_path.read_text(encoding="utf-8")
+    assert "C4 Architecture Diff" in html
+    assert "double-click a node to drill down" in html
+    assert "#0072B2" in html
+    assert "triangleDown" in html
+
+
+def test_workspace_composition_namespaces_facts_and_keeps_contracts_declared(tmp_path):
+    model = {
+        "schema": "graphify.architecture/v1",
+        "repositories": [
+            {"id": "web", "path": "web"},
+            {"id": "api", "path": "api"},
+        ],
+        "scope": {"include": ["web/src/**", "api/src/**"]},
+        "elements": [
+            {"id": "system", "c4_type": "software_system", "name": "System"},
+            {"id": "web.container", "c4_type": "container", "parent": "system", "name": "Web"},
+            {"id": "api.container", "c4_type": "container", "parent": "system", "name": "API"},
+            {"id": "web.ui", "c4_type": "component", "parent": "web.container", "name": "UI",
+             "implementation": [{"path_prefix": "web/src"}]},
+            {"id": "api.handlers", "c4_type": "component", "parent": "api.container", "name": "Handlers",
+             "implementation": [{"path_prefix": "api/src"}]},
+        ],
+        "relations": [{"source": "web.container", "target": "api.container", "kind": "http"}],
+        "rules": [],
+    }
+    raw_graph = {
+        "nodes": [{"id": "main", "label": "main", "file_type": "code", "source_file": "src/main.ts"}],
+        "links": [{"source": "main", "target": "main", "relation": "contains", "source_file": "src/main.ts"}],
+    }
+    for repository in ("web", "api"):
+        output = tmp_path / repository / "graphify-out"
+        output.mkdir(parents=True)
+        (output / "graph.json").write_text(json.dumps(raw_graph), encoding="utf-8")
+    model_path = tmp_path / "model.json"
+    model_path.write_text(json.dumps(model), encoding="utf-8")
+
+    composed = compose_workspace_graph(load_model(model_path), tmp_path)
+    projection_path = tmp_path / "architecture.json"
+    graph_path = tmp_path / "workspace-graph.json"
+    projection = sync_workspace(model_path, tmp_path, projection_path, graph_path)
+
+    assert {item["id"] for item in composed["nodes"]} == {"web::main", "api::main"}
+    assert {item["source_file"] for item in composed["nodes"]} == {"web/src/main.ts", "api/src/main.ts"}
+    assert {item["id"] for item in projection["elements"] if item["c4_type"] == "code"} == {
+        "code:web::main", "code:api::main",
+    }
+    assert projection["workspace_repositories"] == [
+        {"id": "web", "path": "web", "graph": "web/graphify-out/graph.json", "nodes": 1, "links": 1},
+        {"id": "api", "path": "api", "graph": "api/graphify-out/graph.json", "nodes": 1, "links": 1},
+    ]
+    assert projection["declared_relations"] == model["relations"]
+    assert projection_path.exists() and graph_path.exists()
+
+
+def test_workspace_html_cli_writes_all_level_explorer(monkeypatch, tmp_path, capsys):
+    model = {
+        "schema": "graphify.architecture/v1",
+        "repositories": [{"id": "web", "path": "web"}],
+        "scope": {"include": ["web/src/**"]},
+        "elements": [
+            {"id": "system", "c4_type": "software_system", "name": "System"},
+            {"id": "web.container", "c4_type": "container", "parent": "system", "name": "Web"},
+            {"id": "web.ui", "c4_type": "component", "parent": "web.container", "name": "UI",
+             "implementation": [{"path_prefix": "web/src"}]},
+        ],
+        "relations": [], "rules": [],
+    }
+    model_path = tmp_path / "model.json"
+    model_path.write_text(json.dumps(model), encoding="utf-8")
+    graph_dir = tmp_path / "web/graphify-out"
+    graph_dir.mkdir(parents=True)
+    (graph_dir / "graph.json").write_text(json.dumps({
+        "nodes": [{"id": "ui", "label": "render", "file_type": "code", "source_file": "src/render.ts"}],
+        "links": [],
+    }), encoding="utf-8")
+    projection_path = tmp_path / "architecture.json"
+    workspace_graph_path = tmp_path / "workspace-graph.json"
+    html_path = tmp_path / "architecture.html"
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv", [
+        "graphify", "architecture", "workspace", "html", "--model", str(model_path), "--root", str(tmp_path),
+        "--out", str(projection_path), "--graph-out", str(workspace_graph_path), "--output", str(html_path),
+    ])
+
+    mainmod.main()
+
+    assert "Workspace architecture projection" in capsys.readouterr().out
+    assert html_path.exists()
+    html = html_path.read_text(encoding="utf-8")
+    assert "Graphify C4 Architecture" in html
+    assert "web::ui" in html
+
+
+def test_workspace_composition_relativizes_absolute_source_paths(tmp_path):
+    model = {
+        "schema": "graphify.architecture/v1",
+        "repositories": [{"id": "android", "path": "mobile/android"}],
+        "scope": {"include": ["mobile/android/**"]},
+        "elements": [
+            {"id": "system", "c4_type": "software_system", "name": "System"},
+            {"id": "app", "c4_type": "container", "parent": "system", "name": "Android app"},
+            {"id": "app.code", "c4_type": "component", "parent": "app", "name": "App code",
+             "implementation": [{"path_prefix": "mobile/android"}]},
+        ],
+        "relations": [], "rules": [],
+    }
+    repository = tmp_path / "mobile/android"
+    source_file = repository / "app/src/main/kotlin/com/example/MainActivity.kt"
+    graph_dir = repository / "graphify-out"
+    graph_dir.mkdir(parents=True)
+    (graph_dir / "graph.json").write_text(json.dumps({
+        "nodes": [{"id": "activity", "label": "MainActivity", "file_type": "code", "source_file": str(source_file)}],
+        "links": [],
+    }), encoding="utf-8")
+    model_path = tmp_path / "model.json"
+    model_path.write_text(json.dumps(model), encoding="utf-8")
+
+    composed = compose_workspace_graph(load_model(model_path), tmp_path)
+
+    assert composed["nodes"][0]["source_file"] == "mobile/android/app/src/main/kotlin/com/example/MainActivity.kt"
+
+
+def test_workspace_init_creates_portable_language_neutral_starter(monkeypatch, tmp_path, capsys):
+    model_path = tmp_path / "architecture" / "graphify.workspace.c4.json"
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv", [
+        "graphify", "architecture", "workspace", "init", "--model", str(model_path),
+        "--system", "Storefront", "--repo", "web=web", "--repo", "api=services/api",
+        "--repo", "android-app=mobile/android",
+    ])
+
+    mainmod.main()
+
+    model = json.loads(model_path.read_text(encoding="utf-8"))
+    assert "Created workspace architecture model" in capsys.readouterr().out
+    assert validate_model(model) == []
+    assert model["repositories"] == [
+        {"id": "web", "path": "web"},
+        {"id": "api", "path": "services/api"},
+        {"id": "android-app", "path": "mobile/android"},
+    ]
+    assert model["scope"]["include"] == ["web/**", "services/api/**", "mobile/android/**"]
+    assert {item["id"] for item in model["elements"]} == {
+        "system", "container.web", "container.api", "container.android-app",
+    }
+    assert model["component_generators"] == []

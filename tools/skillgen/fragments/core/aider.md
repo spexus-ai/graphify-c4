@@ -31,6 +31,9 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify query "<question>" --budget 1500            # cap answer at N tokens
 /graphify path "AuthModule" "Database"                # shortest path between two concepts
 /graphify explain "SwinTransformer"                   # plain-language explanation of a node
+/graphify architecture init                            # create a versioned single-repository C4 contract
+/graphify architecture workspace init --repo web=web --repo api=services/api  # create a portable multi-repo C4 starter
+/graphify architecture workspace html --model architecture/graphify.workspace.c4.json --root .  # compose an interactive C4 view
 ```
 
 ## What graphify is for
@@ -47,6 +50,8 @@ Use it for:
 - A reading list (papers + tweets + notes → one navigable graph)
 - A research corpus (citation graph + concept graph in one)
 - Your personal /raw folder (drop everything in, let it grow, query it)
+
+**Architecture mode:** For architecture boundaries, C4, component ownership, or dependency rules, use a declared model instead of inferring systems from clusters. With `architecture/graphify.c4.json`, run `graphify architecture validate`, `audit --suspect`, then the smallest relevant `view`, `up`, `down`, or `impact` command; use `architecture html` for the interactive view. For several repositories, use `architecture/graphify.workspace.c4.json`: extract each repository into its own `graphify-out/graph.json`, then run `graphify architecture workspace sync --model architecture/graphify.workspace.c4.json --root .` or `workspace html`. If the workspace model is absent, offer `workspace init --repo ID=RELATIVE_PATH`. Cross-repository HTTP, message, CLI, and datastore boundaries must be declared contracts, never inferred implementation edges.
 
 ## What You Must Do When Invoked
 

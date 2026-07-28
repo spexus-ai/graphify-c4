@@ -74,6 +74,83 @@ def test_ts_calls_are_extracted():
             assert e["confidence"] == "EXTRACTED"
 
 
+def test_tsx_extracts_component_render_edges(tmp_path):
+    source = tmp_path / "view.tsx"
+    source.write_text(
+        """function EmptyState() { return <span />; }
+function ActionState() { return <button />; }
+function MembersView() {
+  return <section><EmptyState /><ActionState /></section>;
+}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_js(source)
+    assert ("MembersView", "EmptyState") in _edge_labels(result, "renders", "jsx")
+    assert ("MembersView", "ActionState") in _edge_labels(result, "renders", "jsx")
+
+
+def test_tsx_extracts_dynamic_import_from_react_lazy_factory(tmp_path):
+    page = tmp_path / "epic-hierarchy-page.tsx"
+    page.write_text("export function EpicHierarchyPage() { return <main />; }\n", encoding="utf-8")
+    router = tmp_path / "routes.tsx"
+    router.write_text(
+        """import { lazy } from 'react';
+const EpicHierarchyPage = lazy(() => import('./epic-hierarchy-page').then((m) => ({ default: m.EpicHierarchyPage })));
+const protectedRoutes = [{ element: <EpicHierarchyPage /> }];
+export function AppRouter() { return <>{protectedRoutes.map((route) => route.element)}</>; }
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_js(router)
+    dynamic_imports = [edge for edge in result["edges"] if edge["relation"] == "dynamic_import"]
+    assert any(edge.get("target_file") == str(page) for edge in dynamic_imports)
+    assert any(
+        call["caller_nid"].endswith("approuter") and call["callee"] == "EpicHierarchyPage"
+        and call["relation"] == "renders"
+        for call in result["raw_calls"]
+    )
+
+
+def test_tsx_extracts_module_level_react_entrypoint_render(tmp_path):
+    entry = tmp_path / "main.tsx"
+    entry.write_text(
+        """import { AppRouter } from './routes';
+createRoot(document.getElementById('root')).render(<AppRouter />);
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_js(entry)
+    assert any(
+        call["caller_nid"].endswith("main_tsx") and call["callee"] == "AppRouter"
+        and call["relation"] == "renders"
+        for call in result["raw_calls"]
+    )
+
+
+def test_ts_classifies_error_types(tmp_path):
+    source = tmp_path / "errors.ts"
+    source.write_text(
+        """class RequestTimeoutError extends Error {}
+class ApiClient {}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_js(source)
+    roles = {
+        node["label"]: node["metadata"]["architecture_role"]
+        for node in result["nodes"]
+        if node.get("metadata", {}).get("language") == "typescript"
+    }
+
+    assert roles["RequestTimeoutError"] == "error"
+    assert roles["ApiClient"] == "runtime_actor"
+
+
 def test_ts_import_edges_have_import_context():
     r = extract_js(FIXTURES / "sample.ts")
     import_edges = _edges_with_relation(r, "imports", "imports_from")
@@ -107,6 +184,163 @@ def test_go_finds_methods():
     labels = _labels(r)
     assert any("Start" in l for l in labels)
     assert any("Stop" in l for l in labels)
+
+
+def test_go_keeps_exported_interface_and_unexported_struct_distinct(tmp_path):
+    source = tmp_path / "service.go"
+    source.write_text(
+        """package service
+
+type RoleService interface { Create() }
+type roleService struct{}
+func (s *roleService) Create() {}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_go(source)
+    by_label = {node["label"]: node for node in result["nodes"]}
+    method_edge = next(edge for edge in result["edges"] if edge["relation"] == "method")
+
+    assert by_label["RoleService"]["id"] != by_label["roleService"]["id"]
+    assert by_label["RoleService"]["metadata"]["kind"] == "interface"
+    assert by_label["roleService"]["metadata"]["kind"] == "struct"
+    assert method_edge["source"] == by_label["roleService"]["id"]
+
+
+def test_go_classifies_runtime_contract_value_and_error_types(tmp_path):
+    source = tmp_path / "types.go"
+    source.write_text(
+        """package types
+
+type CreateRequest struct{}
+type HealthOutcome struct{}
+type transportFault struct{}
+type Service struct{}
+
+func (*transportFault) Error() string { return "fault" }
+func (*Service) Run() {}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_go(source)
+    roles = {
+        node["label"]: node["metadata"]["architecture_role"]
+        for node in result["nodes"]
+        if node.get("metadata", {}).get("language") == "go"
+    }
+
+    assert roles["CreateRequest"] == "contract"
+    assert roles["HealthOutcome"] == "value"
+    assert roles["transportFault"] == "error"
+    assert roles["Service"] == "runtime_actor"
+
+def test_go_resolves_typed_local_receiver_and_emits_dto_use(tmp_path):
+    source = tmp_path / "requests.go"
+    source.write_text(
+        """package requests
+
+type createRequest struct{}
+type updateRequest struct{}
+
+func (createRequest) Validate() {}
+func (updateRequest) Validate() {}
+
+func Create() {
+    var request createRequest
+    request.Validate()
+}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_go(source)
+    create_id = next(node["id"] for node in result["nodes"] if node["label"] == "createRequest")
+    create_method = next(
+        node["id"] for node in result["nodes"]
+        if node["label"] == ".Validate()" and node["id"].startswith(create_id)
+    )
+    caller = next(node["id"] for node in result["nodes"] if node["label"] == "Create()")
+    calls = {
+        (edge["source"], edge["target"])
+        for edge in result["edges"]
+        if edge["relation"] == "calls"
+    }
+    local_refs = {
+        (edge["source"], edge["target"])
+        for edge in result["edges"]
+        if edge["relation"] == "references" and edge.get("context") == "local_variable_type"
+    }
+
+    assert (caller, create_method) in calls
+    assert (caller, create_id) in local_refs
+
+
+def test_go_extracts_factory_registered_runtime_relationship(tmp_path):
+    (tmp_path / "registry.go").write_text(
+        """package service
+
+type Registry interface { Register(Provider) }
+type Provider interface{}
+type RegistryImpl struct{}
+func makeRegistry() Registry { return &RegistryImpl{} }
+func (*RegistryImpl) Register(Provider) {}
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "provider.go").write_text(
+        """package service
+
+type ProviderImpl struct{}
+func makeProvider() Provider { return &ProviderImpl{} }
+type ServiceImpl struct{}
+func makeService(Registry) *ServiceImpl { return &ServiceImpl{} }
+type HandlerImpl struct{}
+func makeHandler(*ServiceImpl) *HandlerImpl {
+    handler := &HandlerImpl{}
+    return handler
+}
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "setup.go").write_text(
+        """package service
+
+func composeService(registry Registry) *ServiceImpl {
+    service := makeService(registry)
+    return service
+}
+
+func wire() {
+    registry := makeRegistry()
+    provider := makeProvider()
+    registry.Register(provider)
+    service := composeService(registry)
+    _ = makeHandler(service)
+}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract(
+        sorted(tmp_path.glob("*.go")), root=tmp_path, parallel=False, force=True,
+    )
+    labels = {node["id"]: node["label"] for node in result["nodes"]}
+    registrations = {
+        (labels.get(edge["source"]), labels.get(edge["target"]))
+        for edge in result["edges"]
+        if edge["relation"] == "registers"
+    }
+
+    assert ("RegistryImpl", "ProviderImpl") in registrations
+    injections = {
+        (labels.get(edge["source"]), labels.get(edge["target"]))
+        for edge in result["edges"]
+        if edge["relation"] == "uses" and edge.get("context") == "factory_injection"
+    }
+    assert ("ServiceImpl", "RegistryImpl") in injections
+    assert ("HandlerImpl", "ServiceImpl") in injections
 
 def test_go_finds_constructor():
     r = extract_go(FIXTURES / "sample.go")

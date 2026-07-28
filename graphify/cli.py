@@ -849,6 +849,12 @@ def dispatch_command(cmd: str) -> None:
         else:
             print("Usage: graphify hook [install|uninstall|status]", file=sys.stderr)
             sys.exit(1)
+    elif cmd == "architecture":
+        from graphify.architecture import dispatch_cli
+
+        exit_code = dispatch_cli(sys.argv[2:])
+        if exit_code:
+            sys.exit(exit_code)
     elif cmd == "query":
         if len(sys.argv) < 3:
             print("Usage: graphify query \"<question>\" [--dfs] [--context C] [--budget N] [--graph path]", file=sys.stderr)
@@ -3033,7 +3039,7 @@ def dispatch_command(cmd: str) -> None:
             # graphify-out/ dir into a project that asked for external output.
             # `root` stays the scanned project so source_file/ids relativize
             # against it; conflating the two basenamed every node (#1941).
-            ast_kwargs: dict = {"cache_root": out_root, "root": target}
+            ast_kwargs: dict = {"cache_root": out_root, "root": target, "force": force}
             if cli_max_workers is not None:
                 ast_kwargs["max_workers"] = cli_max_workers
             print(f"[graphify extract] AST extraction on {len(code_files)} code files...")
