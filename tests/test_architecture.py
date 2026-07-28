@@ -376,6 +376,7 @@ def test_architecture_html_cli_writes_interactive_c4_view(monkeypatch, tmp_path,
     assert "row.onclick=event=>{if(event.target===checkbox)return;focusNode(item.id);}" in html
     assert "entry.onclick=()=>{focusNode(item.id);" in html
     assert "if(link)focusNode(link.dataset.nid)" in html
+    assert "pinnedNodeId=nodeId;cameraTargetId=nodeId;updateGraph();" in html
 
 
 def test_architecture_diff_cli_writes_all_levels_and_interactive_view(monkeypatch, tmp_path, capsys):
