@@ -236,6 +236,51 @@ func Create() {
     assert (caller, create_method) in calls
     assert (caller, create_id) in local_refs
 
+
+def test_go_extracts_factory_registered_runtime_relationship(tmp_path):
+    (tmp_path / "registry.go").write_text(
+        """package service
+
+type Registry interface { Register(Provider) }
+type Provider interface{}
+type RegistryImpl struct{}
+func NewRegistry() Registry { return &RegistryImpl{} }
+func (*RegistryImpl) Register(Provider) {}
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "provider.go").write_text(
+        """package service
+
+type ProviderImpl struct{}
+func NewProvider() Provider { return &ProviderImpl{} }
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "setup.go").write_text(
+        """package service
+
+func Setup() {
+    registry := NewRegistry()
+    provider := NewProvider()
+    registry.Register(provider)
+}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract(
+        sorted(tmp_path.glob("*.go")), root=tmp_path, parallel=False, force=True,
+    )
+    labels = {node["id"]: node["label"] for node in result["nodes"]}
+    registrations = {
+        (labels.get(edge["source"]), labels.get(edge["target"]))
+        for edge in result["edges"]
+        if edge["relation"] == "registers"
+    }
+
+    assert ("RegistryImpl", "ProviderImpl") in registrations
+
 def test_go_finds_constructor():
     r = extract_go(FIXTURES / "sample.go")
     assert any("NewServer" in l for l in _labels(r))

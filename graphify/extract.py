@@ -4651,6 +4651,7 @@ def extract(
     all_edges: list[dict] = []
     all_raw_calls: list[dict] = []
     all_raw_type_refs: list[dict] = []
+    all_raw_registrations: list[dict] = []
     # Extractors retain a convenient basename in ``source_file``.  Keep the
     # project-relative directory separately while aggregating: Go package
     # imports are directory-addressed and two ``service.go`` files can coexist.
@@ -4660,6 +4661,7 @@ def extract(
         all_edges.extend(result.get("edges", []))
         all_raw_calls.extend(result.get("raw_calls", []))
         all_raw_type_refs.extend(result.get("raw_type_refs", []))
+        all_raw_registrations.extend(result.get("raw_registrations", []))
         try:
             relative_dir = source_path.resolve().relative_to(root.resolve()).parent.as_posix()
         except (OSError, RuntimeError, ValueError):
@@ -5491,6 +5493,68 @@ def extract(
                 "source_location": rc.get("source_location"),
                 "weight": 1.0,
             })
+
+    # Go dependency-injection wiring: a direct local product of ``NewRegistry``
+    # receiving a direct local product of ``NewProvider`` through ``Register…``
+    # is an exact runtime relationship, even when both factories expose
+    # interfaces.  The per-file extractor records the binding and each factory's
+    # direct ``return &Concrete{…}``; resolve both only within the caller's Go
+    # package and emit the concrete ``registers`` relationship.  No interface
+    # conformance or name-based implementation guessing is involved.
+    factory_constructs: dict[str, set[str]] = {}
+    for edge in all_edges:
+        if edge.get("relation") == "constructs":
+            factory_constructs.setdefault(str(edge.get("source", "")), set()).add(
+                str(edge.get("target", ""))
+            )
+
+    def _go_local_factory(factory_name: object, source_file: object) -> str | None:
+        candidates = [
+            candidate for candidate in global_label_to_nids.get(str(factory_name), [])
+            if candidate in go_callable_nids
+            and (nid_to_project_dir.get(candidate) or _go_source_dir(nid_to_source_file.get(candidate, "")))
+            == _go_source_dir(source_file)
+            and not str(nid_to_source_file.get(candidate, "")).endswith("_test.go")
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    existing_relation_triplets = {
+        (str(edge.get("source", "")), str(edge.get("target", "")), str(edge.get("relation", "")))
+        for edge in all_edges
+    }
+    for registration in all_raw_registrations:
+        if not isinstance(registration, dict) or registration.get("language") != "go":
+            continue
+        registry_factory = _go_local_factory(
+            registration.get("registry_factory"), registration.get("source_file", "")
+        )
+        provider_factory = _go_local_factory(
+            registration.get("registered_factory"), registration.get("source_file", "")
+        )
+        if registry_factory is None or provider_factory is None:
+            continue
+        registry_types = factory_constructs.get(registry_factory, set())
+        provider_types = factory_constructs.get(provider_factory, set())
+        if len(registry_types) != 1 or len(provider_types) != 1:
+            continue
+        registry_type = next(iter(registry_types))
+        provider_type = next(iter(provider_types))
+        triplet = (registry_type, provider_type, "registers")
+        if registry_type == provider_type or triplet in existing_relation_triplets:
+            continue
+        existing_relation_triplets.add(triplet)
+        all_edges.append({
+            "source": registry_type,
+            "target": provider_type,
+            "relation": "registers",
+            "context": "factory_registration",
+            "confidence": "EXTRACTED",
+            "confidence_score": 1.0,
+            "resolution": "go_registration_factory",
+            "source_file": registration.get("source_file", ""),
+            "source_location": registration.get("source_location"),
+            "weight": 1.0,
+        })
 
     # Cross-file, language-specific member-call resolution. Runs after the shared
     # call pass so node ids/caller_nids are final; each pass is additive (only the

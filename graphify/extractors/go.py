@@ -94,6 +94,11 @@ def extract_go(path: Path) -> dict:
     function_bodies: list[tuple[str, object]] = []
     go_imported_pkgs: dict[str, str] = {}  # local package name/alias -> import path
     raw_type_refs: list[dict] = []
+    # A dependency-injection setup often constructs an implementation through a
+    # factory, stores it in a local, and then registers it with another factory
+    # product.  Keep this small structural trace for the corpus pass, where both
+    # factory return types can be resolved across files in the Go package.
+    raw_registrations: list[dict] = []
     # A method name is not unique in Go: two receiver types may both expose
     # Validate().  Calls are resolved after declarations have been collected,
     # keyed by the receiver's static type rather than the bare method name.
@@ -298,6 +303,45 @@ def extract_go(path: Path) -> dict:
                     ctx = "generic_arg" if role == "generic_arg" else "return_type"
                     emit_type_ref(func_nid, ref_name, role, "references", line, ctx)
 
+    def emit_factory_construction_edge(func_node, func_nid: str, func_name: str) -> None:
+        """Link a conventional ``New…`` factory to its direct concrete return.
+
+        A factory may expose an interface as its declared return type, while its
+        ``return &Concrete{…}`` expression is exact evidence of the runtime
+        implementation.  This is deliberately limited to direct composite
+        literal returns; forwarding/wrapping factories remain unresolved.
+        """
+        if not func_name.startswith("New"):
+            return
+
+        def visit(candidate) -> None:
+            if candidate.type == "return_statement":
+                expressions = list(candidate.children)
+                while expressions:
+                    expression = expressions.pop()
+                    if expression.type == "unary_expression":
+                        operand = expression.child_by_field_name("operand")
+                        if operand is not None and operand.type == "composite_literal":
+                            type_node = operand.child_by_field_name("type")
+                            type_name = _read_text(type_node, source).strip() if type_node else ""
+                            if type_name and "." not in type_name:
+                                target_nid = ensure_named_node(type_name, candidate.start_point[0] + 1)
+                                if target_nid != func_nid:
+                                    add_edge(
+                                        func_nid, target_nid, "constructs",
+                                        candidate.start_point[0] + 1,
+                                        context="factory_return",
+                                    )
+                    else:
+                        expressions.extend(expression.children)
+                return
+            for child in candidate.children:
+                visit(child)
+
+        body = func_node.child_by_field_name("body")
+        if body is not None:
+            visit(body)
+
     def walk(node) -> None:
         t = node.type
 
@@ -310,6 +354,7 @@ def extract_go(path: Path) -> dict:
                 add_node(func_nid, f"{func_name}()", line)
                 add_edge(file_nid, func_nid, "contains", line)
                 emit_go_method_refs(node, func_nid, line)
+                emit_factory_construction_edge(node, func_nid, func_name)
                 body = node.child_by_field_name("body")
                 if body:
                     function_bodies.append((func_nid, body))
@@ -503,6 +548,78 @@ def extract_go(path: Path) -> dict:
             )
         return local_types
 
+    def emit_factory_registration_trace(caller_nid: str, body_node) -> None:
+        """Record proven Go factory-to-registry wiring for the corpus resolver.
+
+        Only a direct ``name := NewFactory(...)`` binding followed by
+        ``registry.Register…(name)`` qualifies.  This avoids guessing from
+        interface conformance or a matching type name.
+        """
+        local_factories: dict[str, tuple[str, int]] = {}
+
+        def direct_factory_name(expression) -> str | None:
+            if expression is None or expression.type != "call_expression":
+                return None
+            function = expression.child_by_field_name("function")
+            if function is None or function.type != "identifier":
+                return None
+            name = _read_text(function, source)
+            return name if name.startswith("New") else None
+
+        def expression_list_items(node) -> list:
+            return [child for child in node.children if child.is_named] if node is not None else []
+
+        def visit(node) -> None:
+            if node.type in ("function_declaration", "method_declaration"):
+                return
+            if node.type == "short_var_declaration":
+                left = node.child_by_field_name("left")
+                right = node.child_by_field_name("right")
+                names = expression_list_items(left)
+                values = expression_list_items(right)
+                if len(names) == 1 and len(values) == 1 and names[0].type == "identifier":
+                    factory = direct_factory_name(values[0])
+                    if factory:
+                        local_factories[_read_text(names[0], source)] = (
+                            factory, node.start_point[0] + 1,
+                        )
+            elif node.type == "call_expression":
+                function = node.child_by_field_name("function")
+                arguments = node.child_by_field_name("arguments")
+                if function is not None and function.type == "selector_expression":
+                    field = function.child_by_field_name("field")
+                    receiver = function.child_by_field_name("operand")
+                    argument_values = expression_list_items(arguments)
+                    method = _read_text(field, source) if field is not None else ""
+                    receiver_name = _read_text(receiver, source) if receiver is not None else ""
+                    provider_name = (
+                        _read_text(argument_values[0], source)
+                        if len(argument_values) == 1 and argument_values[0].type == "identifier"
+                        else ""
+                    )
+                    registry_factory = local_factories.get(receiver_name)
+                    provider_factory = local_factories.get(provider_name)
+                    if (
+                        method.startswith("Register")
+                        and registry_factory is not None
+                        and provider_factory is not None
+                        and registry_factory[1] < node.start_point[0] + 1
+                        and provider_factory[1] < node.start_point[0] + 1
+                    ):
+                        raw_registrations.append({
+                            "caller_nid": caller_nid,
+                            "registry_factory": registry_factory[0],
+                            "registered_factory": provider_factory[0],
+                            "method": method,
+                            "language": "go",
+                            "source_file": str_path,
+                            "source_location": f"L{node.start_point[0] + 1}",
+                        })
+            for child in node.children:
+                visit(child)
+
+        visit(body_node)
+
     def walk_calls(node, caller_nid: str, local_types: dict[str, str]) -> None:
         if node.type in ("function_declaration", "method_declaration"):
             return
@@ -587,6 +704,7 @@ def extract_go(path: Path) -> dict:
 
     for caller_nid, body_node in function_bodies:
         local_types = emit_local_variable_type_refs(caller_nid, body_node)
+        emit_factory_registration_trace(caller_nid, body_node)
         walk_calls(body_node, caller_nid, local_types)
 
     valid_ids = seen_ids
@@ -601,4 +719,5 @@ def extract_go(path: Path) -> dict:
         "edges": clean_edges,
         "raw_calls": raw_calls,
         "raw_type_refs": raw_type_refs,
+        "raw_registrations": raw_registrations,
     }
