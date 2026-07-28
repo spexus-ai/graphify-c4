@@ -130,6 +130,46 @@ func (s *roleService) Create() {}
     assert by_label["roleService"]["metadata"]["kind"] == "struct"
     assert method_edge["source"] == by_label["roleService"]["id"]
 
+def test_go_resolves_typed_local_receiver_and_emits_dto_use(tmp_path):
+    source = tmp_path / "requests.go"
+    source.write_text(
+        """package requests
+
+type createRequest struct{}
+type updateRequest struct{}
+
+func (createRequest) Validate() {}
+func (updateRequest) Validate() {}
+
+func Create() {
+    var request createRequest
+    request.Validate()
+}
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_go(source)
+    create_id = next(node["id"] for node in result["nodes"] if node["label"] == "createRequest")
+    create_method = next(
+        node["id"] for node in result["nodes"]
+        if node["label"] == ".Validate()" and node["id"].startswith(create_id)
+    )
+    caller = next(node["id"] for node in result["nodes"] if node["label"] == "Create()")
+    calls = {
+        (edge["source"], edge["target"])
+        for edge in result["edges"]
+        if edge["relation"] == "calls"
+    }
+    local_refs = {
+        (edge["source"], edge["target"])
+        for edge in result["edges"]
+        if edge["relation"] == "references" and edge.get("context") == "local_variable_type"
+    }
+
+    assert (caller, create_method) in calls
+    assert (caller, create_id) in local_refs
+
 def test_go_finds_constructor():
     r = extract_go(FIXTURES / "sample.go")
     assert any("NewServer" in l for l in _labels(r))

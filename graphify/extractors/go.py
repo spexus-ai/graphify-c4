@@ -94,6 +94,10 @@ def extract_go(path: Path) -> dict:
     function_bodies: list[tuple[str, object]] = []
     go_imported_pkgs: dict[str, str] = {}  # local package name/alias -> import path
     raw_type_refs: list[dict] = []
+    # A method name is not unique in Go: two receiver types may both expose
+    # Validate().  Calls are resolved after declarations have been collected,
+    # keyed by the receiver's static type rather than the bare method name.
+    method_nids_by_receiver: dict[str, dict[str, str]] = {}
 
     def add_node(
         nid: str, label: str, line: int, metadata: dict[str, object] | None = None,
@@ -308,6 +312,7 @@ def extract_go(path: Path) -> dict:
                 method_nid = _make_id(parent_nid, method_name)
                 add_node(method_nid, f".{method_name}()", line)
                 add_edge(parent_nid, method_nid, "method", line)
+                method_nids_by_receiver.setdefault(receiver_type, {})[method_name] = method_nid
             else:
                 method_nid = _make_id(stem, method_name)
                 add_node(method_nid, f"{method_name}()", line)
@@ -430,7 +435,50 @@ def extract_go(path: Path) -> dict:
     seen_call_pairs: set[tuple[str, str]] = set()
     raw_calls: list[dict] = []
 
-    def walk_calls(node, caller_nid: str) -> None:
+    def local_variable_types(body_node) -> dict[str, str]:
+        """Collect explicit ``var name Type`` declarations in a function body.
+
+        This intentionally avoids general Go type inference.  Explicit local
+        declarations are unambiguous evidence that the enclosing function
+        consumes a DTO/type and provide the static receiver type necessary to
+        resolve calls such as ``request.Validate()``.
+        """
+        result: dict[str, str] = {}
+
+        def visit(node) -> None:
+            if node.type == "var_spec":
+                names = [child for child in node.children if child.type == "identifier"]
+                type_node = node.child_by_field_name("type")
+                if type_node is None:
+                    type_node = next(
+                        (child for child in node.children if child.is_named and child.type != "identifier"),
+                        None,
+                    )
+                refs: list[tuple[str, str]] = []
+                _go_collect_type_refs(type_node, source, False, refs)
+                if refs:
+                    for name_node in names:
+                        result[_read_text(name_node, source)] = refs[0][0]
+            for child in node.children:
+                visit(child)
+
+        visit(body_node)
+        return result
+
+    def emit_local_variable_type_refs(caller_nid: str, body_node) -> dict[str, str]:
+        local_types = local_variable_types(body_node)
+        for ref_name in set(local_types.values()):
+            emit_type_ref(
+                caller_nid,
+                ref_name,
+                "type",
+                "references",
+                body_node.start_point[0] + 1,
+                "local_variable_type",
+            )
+        return local_types
+
+    def walk_calls(node, caller_nid: str, local_types: dict[str, str]) -> None:
         if node.type in ("function_declaration", "method_declaration"):
             return
         if node.type == "call_expression":
@@ -469,9 +517,18 @@ def extract_go(path: Path) -> dict:
                         "source_location": f"L{node.start_point[0] + 1}",
                     })
                     for child in node.children:
-                        walk_calls(child, caller_nid)
+                        walk_calls(child, caller_nid, local_types)
                     return
-                tgt_nid = label_to_nid.get(callee_name)
+                tgt_nid = None
+                if is_member_call:
+                    # Do not fall back to a global same-name method: that
+                    # fabricates edges when several types implement it.  A
+                    # local ``var req createProjectRequest`` gives us proof.
+                    receiver_type = local_types.get(receiver_name)
+                    if receiver_type:
+                        tgt_nid = method_nids_by_receiver.get(receiver_type, {}).get(callee_name)
+                else:
+                    tgt_nid = label_to_nid.get(callee_name)
                 if tgt_nid and tgt_nid != caller_nid:
                     pair = (caller_nid, tgt_nid)
                     if pair not in seen_call_pairs:
@@ -501,10 +558,11 @@ def extract_go(path: Path) -> dict:
                         "source_location": f"L{node.start_point[0] + 1}",
                     })
         for child in node.children:
-            walk_calls(child, caller_nid)
+            walk_calls(child, caller_nid, local_types)
 
     for caller_nid, body_node in function_bodies:
-        walk_calls(body_node, caller_nid)
+        local_types = emit_local_variable_type_refs(caller_nid, body_node)
+        walk_calls(body_node, caller_nid, local_types)
 
     valid_ids = seen_ids
     clean_edges = []
