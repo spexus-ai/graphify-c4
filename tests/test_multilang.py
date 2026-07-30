@@ -236,6 +236,69 @@ func (*Service) Run() {}
     assert roles["transportFault"] == "error"
     assert roles["Service"] == "runtime_actor"
 
+
+def test_go_extracts_local_type_alias_target(tmp_path):
+    source = tmp_path / "contracts.go"
+    source.write_text(
+        """package contracts
+
+type ProjectScopedService interface { Run() }
+type MCPService = ProjectScopedService
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_go(source)
+    nodes = {node["label"]: node for node in result["nodes"]}
+    alias_edge = next(edge for edge in result["edges"] if edge["relation"] == "aliases")
+
+    assert nodes["MCPService"]["source_file"] == str(source)
+    assert nodes["MCPService"]["metadata"]["kind"] == "alias"
+    assert nodes["MCPService"]["metadata"]["architecture_role"] == "contract"
+    assert alias_edge["source"] == nodes["MCPService"]["id"]
+    assert alias_edge["target"] == nodes["ProjectScopedService"]["id"]
+    assert alias_edge["context"] == "type_alias_target"
+
+
+def test_go_generic_alias_targets_named_type_not_type_parameter(tmp_path):
+    source = tmp_path / "generic_alias.go"
+    source.write_text(
+        """package contracts
+
+type Result[T any] struct { Value T }
+type Page[T any] = Result[T]
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_go(source)
+    nodes = {node["label"]: node for node in result["nodes"]}
+    alias_edges = [edge for edge in result["edges"] if edge["relation"] == "aliases"]
+
+    assert len(alias_edges) == 1
+    assert alias_edges[0]["source"] == nodes["Page"]["id"]
+    assert alias_edges[0]["target"] == nodes["Result"]["id"]
+    assert alias_edges[0]["target"] != nodes["T"]["id"]
+
+
+def test_go_alias_chain_preserves_each_exact_target(tmp_path):
+    source = tmp_path / "alias_chain.go"
+    source.write_text(
+        """package contracts
+
+type Target interface { Run() }
+type Middle = Target
+type Public = Middle
+""",
+        encoding="utf-8",
+    )
+
+    result = extract_go(source)
+
+    assert ("Middle", "Target") in _edge_labels(result, "aliases", "type_alias_target")
+    assert ("Public", "Middle") in _edge_labels(result, "aliases", "type_alias_target")
+
+
 def test_go_resolves_typed_local_receiver_and_emits_dto_use(tmp_path):
     source = tmp_path / "requests.go"
     source.write_text(

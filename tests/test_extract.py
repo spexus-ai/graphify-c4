@@ -337,6 +337,72 @@ def test_go_qualified_local_imported_type_has_go_import_type_provenance(tmp_path
     assert edge["import_path"] == "example.test/app/internal/jsonrpc"
 
 
+def test_go_qualified_type_alias_resolves_exact_import_target(tmp_path):
+    """A Go alias binds to the declared type in its exact imported package."""
+    (tmp_path / "go.mod").write_text("module example.test/app\n\ngo 1.24\n", encoding="utf-8")
+    tools = tmp_path / "internal/mcp/tools"
+    service = tmp_path / "internal/service"
+    unrelated = tmp_path / "internal/unrelated"
+    tools.mkdir(parents=True)
+    service.mkdir(parents=True)
+    unrelated.mkdir(parents=True)
+    (service / "service.go").write_text(
+        "package service\n\ntype ProjectScopedCommentService interface { Run() }\n",
+        encoding="utf-8",
+    )
+    (unrelated / "service.go").write_text(
+        "package unrelated\n\ntype ProjectScopedCommentService interface { Ignore() }\n",
+        encoding="utf-8",
+    )
+    alias_file = tools / "comment.go"
+    alias_file.write_text(
+        'package tools\n\nimport "example.test/app/internal/service"\n\n'
+        "type CommentMCPCommentService = service.ProjectScopedCommentService\n",
+        encoding="utf-8",
+    )
+
+    result = extract(
+        [alias_file, service / "service.go", unrelated / "service.go"],
+        cache_root=tmp_path,
+        root=tmp_path,
+    )
+    nodes = {node["id"]: node for node in result["nodes"]}
+    alias = next(
+        node_id for node_id, node in nodes.items()
+        if node["label"] == "CommentMCPCommentService"
+    )
+    edge = next(
+        edge for edge in result["edges"]
+        if edge["source"] == alias and edge["relation"] == "aliases"
+    )
+
+    assert nodes[alias]["source_file"] == "internal/mcp/tools/comment.go"
+    assert nodes[edge["target"]]["source_file"] == "internal/service/service.go"
+    assert edge["resolution"] == "go_import_type"
+    assert edge["context"] == "type_alias_target"
+    assert edge["import_path"] == "example.test/app/internal/service"
+
+
+def test_go_external_type_alias_stays_unresolved(tmp_path):
+    alias_file = tmp_path / "alias.go"
+    local_file = tmp_path / "local.go"
+    alias_file.write_text(
+        'package local\n\nimport "external.example/contracts"\n\n'
+        "type External = contracts.Target\n",
+        encoding="utf-8",
+    )
+    local_file.write_text("package local\n\ntype Target interface{}\n", encoding="utf-8")
+
+    result = extract([alias_file, local_file], cache_root=tmp_path, root=tmp_path)
+    labels = {node["id"]: node["label"] for node in result["nodes"]}
+    alias = next(node_id for node_id, label in labels.items() if label == "External")
+
+    assert not any(
+        edge["source"] == alias and edge["relation"] == "aliases"
+        for edge in result["edges"]
+    )
+
+
 def test_extract_updates_raw_call_callers_after_duplicate_id_disambiguation(tmp_path):
     first = tmp_path / "apps/api/Program.cs"
     second = tmp_path / "tools/api/Program.cs"

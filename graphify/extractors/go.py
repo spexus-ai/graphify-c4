@@ -162,17 +162,21 @@ def extract_go(path: Path) -> dict:
     def collect_type_kinds(node) -> None:
         if node.type == "type_declaration":
             for child in node.children:
-                if child.type != "type_spec":
+                if child.type not in {"type_spec", "type_alias"}:
                     continue
                 name_node = child.child_by_field_name("name")
                 if name_node is None:
+                    continue
+                name = _read_text(name_node, source)
+                if child.type == "type_alias":
+                    declared_type_kinds[name] = "alias"
                     continue
                 type_kind = next(
                     (candidate.type for candidate in child.children if candidate.type in {"struct_type", "interface_type"}),
                     None,
                 )
                 if type_kind is not None:
-                    declared_type_kinds[_read_text(name_node, source)] = type_kind.removesuffix("_type")
+                    declared_type_kinds[name] = type_kind.removesuffix("_type")
         if node.type == "method_declaration":
             name_node = node.child_by_field_name("name")
             receiver = node.child_by_field_name("receiver")
@@ -195,7 +199,9 @@ def extract_go(path: Path) -> dict:
         type_kind = declared_type_kinds.get(name)
         if type_kind is None:
             return None
-        if path.name.endswith("_test.go"):
+        if type_kind == "alias":
+            architecture_role = "contract"
+        elif path.name.endswith("_test.go"):
             architecture_role = "test_support"
         elif name in error_receiver_types or name.lower().endswith("error"):
             architecture_role = "error"
@@ -395,7 +401,7 @@ def extract_go(path: Path) -> dict:
 
         if t == "type_declaration":
             for child in node.children:
-                if child.type != "type_spec":
+                if child.type not in {"type_spec", "type_alias"}:
                     continue
                 name_node = child.child_by_field_name("name")
                 if not name_node:
@@ -405,6 +411,29 @@ def extract_go(path: Path) -> dict:
                 type_nid = _go_type_id(pkg_scope, type_name)
                 add_node(type_nid, type_name, line, type_metadata(type_name))
                 add_edge(file_nid, type_nid, "contains", line)
+                if child.type == "type_alias":
+                    alias_target = child.child_by_field_name("type")
+                    # A generic instantiation aliases its named base type. Type
+                    # arguments do not identify a different declaration and must
+                    # not become phantom targets (for example the T in
+                    # ``type Page[T any] = Result[T]``).
+                    if alias_target is not None and alias_target.type == "generic_type":
+                        alias_target = alias_target.child_by_field_name("type")
+                    if alias_target is not None and alias_target.type in {
+                        "type_identifier", "qualified_type",
+                    }:
+                        refs: list[tuple[str, str]] = []
+                        _go_collect_type_refs(alias_target, source, False, refs)
+                        for ref_name, _role in refs:
+                            emit_type_ref(
+                                type_nid,
+                                ref_name,
+                                "type",
+                                "aliases",
+                                line,
+                                "type_alias_target",
+                            )
+                    continue
                 # Type body: struct fields (with embeds) or interface embedding.
                 type_body = None
                 for tc in child.children:
