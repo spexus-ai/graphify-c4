@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
+import subprocess
+
+import pytest
 
 import graphify.__main__ as mainmod
 from graphify.architecture import (
@@ -471,6 +476,24 @@ def test_architecture_html_cli_writes_interactive_c4_view(monkeypatch, tmp_path,
     assert "entry.onclick=()=>{focusNode(item.id);" in html
     assert "if(link)focusNode(link.dataset.nid)" in html
     assert "pinnedNodeId=nodeId;cameraTargetId=nodeId;updateGraph();" in html
+
+
+def test_architecture_html_inline_javascript_parses(tmp_path):
+    from graphify.architecture_html import write_architecture_html
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to parse the rendered JavaScript")
+    html_path = tmp_path / "architecture.html"
+    write_architecture_html(build_projection(MODEL, GRAPH), html_path)
+    scripts = re.findall(r"<script[^>]*>(.*?)</script>", html_path.read_text(), re.S)
+    inline_scripts = [script for script in scripts if script.strip()]
+    assert inline_scripts
+    for index, script in enumerate(inline_scripts):
+        script_path = tmp_path / f"inline-{index}.js"
+        script_path.write_text(script)
+        result = subprocess.run([node, "--check", str(script_path)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
 
 
 def test_architecture_diff_cli_writes_all_levels_and_interactive_view(monkeypatch, tmp_path, capsys):
