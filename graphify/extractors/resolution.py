@@ -138,6 +138,32 @@ def _read_tsconfig_aliases(tsconfig: Path, base_dir: Path, seen: set) -> dict[st
         if extended_path.exists():
             aliases.update(_read_tsconfig_aliases(extended_path, extended_path.parent, seen))
 
+    # Solution-style TypeScript configurations often have no compiler options
+    # themselves; they point at the browser/server configs through
+    # ``references``.  Those referenced configs are still the authority for
+    # path aliases used by their source trees.  Without this, an import such as
+    # ``@/features/editor`` turns into an external reference even though the
+    # referenced app config inherits the alias from a base config.
+    references = data.get("references")
+    if isinstance(references, list):
+        for reference in references:
+            if not isinstance(reference, dict):
+                continue
+            ref_path = reference.get("path")
+            if not isinstance(ref_path, str) or not ref_path:
+                continue
+            referenced_path = (base_dir / ref_path).resolve()
+            if referenced_path.is_dir():
+                referenced_path = referenced_path / "tsconfig.json"
+            elif not referenced_path.suffix:
+                referenced_path = referenced_path.with_suffix(".json")
+            if referenced_path.exists():
+                aliases.update(
+                    _read_tsconfig_aliases(
+                        referenced_path, referenced_path.parent, seen,
+                    )
+                )
+
     # tsconfig `paths` are resolved relative to `baseUrl` (itself relative to
     # the tsconfig's directory), not the tsconfig directory directly. Honoring
     # baseUrl is required for the common monorepo / NestJS layout where
@@ -657,6 +683,7 @@ def _disambiguate_colliding_node_ids(
     edges: list[dict],
     raw_calls: list[dict],
     root: Path,
+    raw_type_refs: list[dict] | None = None,
 ) -> None:
     """Rewrite only colliding node IDs, using source path as the disambiguator.
 
@@ -785,13 +812,17 @@ def _disambiguate_colliding_node_ids(
         elif edge.get("target") in unambiguous_remaps:
             edge["target"] = unambiguous_remaps[str(edge["target"])]
 
-    for raw_call in raw_calls:
-        call_source_key = _source_key(str(raw_call.get("source_file", "")), root)
-        caller_key = (raw_call.get("caller_nid", ""), call_source_key)
-        if caller_key in remap:
-            raw_call["caller_nid"] = remap[caller_key]
-        elif raw_call.get("caller_nid") in unambiguous_remaps:
-            raw_call["caller_nid"] = unambiguous_remaps[str(raw_call["caller_nid"])]
+    for raw_items, source_field in (
+        (raw_calls, "caller_nid"),
+        (raw_type_refs or [], "source_nid"),
+    ):
+        for raw_item in raw_items:
+            call_source_key = _source_key(str(raw_item.get("source_file", "")), root)
+            caller_key = (raw_item.get(source_field, ""), call_source_key)
+            if caller_key in remap:
+                raw_item[source_field] = remap[caller_key]
+            elif raw_item.get(source_field) in unambiguous_remaps:
+                raw_item[source_field] = unambiguous_remaps[str(raw_item[source_field])]
 
 def _is_type_like_definition(node: dict) -> bool:
     if node.get("type") == "namespace":

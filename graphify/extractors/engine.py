@@ -2397,6 +2397,19 @@ def _extract_generic(
             metadata = None
             if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
                 metadata = {"is_nested_type": True}
+            if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+                metadata = dict(metadata or {})
+                metadata.update({
+                    "language": "typescript" if config.ts_module == "tree_sitter_typescript" else "javascript",
+                    "kind": "class",
+                    "architecture_role": (
+                        "test_support" if path.name.endswith((".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"))
+                        else "error" if class_name.endswith(("Error", "Exception"))
+                        else "contract" if class_name.endswith(("Request", "Response", "Input", "Output", "Params", "Options", "Payload"))
+                        else "value" if class_name.endswith(("Result", "Outcome", "State", "Details", "Info"))
+                        else "runtime_actor"
+                    ),
+                })
             add_node(class_nid, class_name, line, metadata=metadata)
             callable_def_nids.add(class_nid)  # a class is callable (constructor)
             callable_class_nids.add(class_nid)  # ...but only via its constructor (#2137)
@@ -4444,6 +4457,144 @@ def _extract_generic(
     # seen_call_pairs, so a closure inside an initializer is not double-walked.
     for owner_nid, init_node in initializer_nodes:
         walk_calls(init_node, owner_nid)
+
+    # ── React/TSX render graph ───────────────────────────────────────────────
+    # A JSX component invocation is not a JavaScript call_expression, so the
+    # ordinary call graph cannot see `return <EmptyState />`.  Treat it as its
+    # own extracted relation rather than pretending it is a function call:
+    # consumers can distinguish rendering/composition from imperative calls.
+    if path.suffix.lower() == ".tsx":
+        seen_render_pairs: set[tuple[str, str]] = set()
+
+        def jsx_component_name(node) -> str | None:
+            name_node = node.child_by_field_name("name")
+            if name_node is None:
+                name_node = next((child for child in node.children if child.is_named), None)
+            if name_node is None:
+                return None
+            name = _read_text(name_node, source)
+            # Native tags are lower-case.  Namespace/member JSX (`UI.Button`)
+            # needs binding-aware resolution and is deliberately left for a
+            # later pass rather than guessed from its final segment.
+            if not name or "." in name or not name[:1].isupper():
+                return None
+            return name
+
+        def walk_jsx(node, caller_nid: str) -> None:
+            if node.type in ("jsx_opening_element", "jsx_self_closing_element"):
+                component_name = jsx_component_name(node)
+                if component_name:
+                    target_nid = label_to_nid.get(component_name)
+                    if target_nid and target_nid != caller_nid and target_nid in callable_def_nids:
+                        pair = (caller_nid, target_nid)
+                        if pair not in seen_render_pairs:
+                            seen_render_pairs.add(pair)
+                            edges.append({
+                                "source": caller_nid,
+                                "target": target_nid,
+                                "relation": "renders",
+                                "context": "jsx",
+                                "confidence": "EXTRACTED",
+                                "source_file": str_path,
+                                "source_location": f"L{node.start_point[0] + 1}",
+                                "weight": 1.0,
+                            })
+                    else:
+                        # A same-file binding may be a lazy/imported component
+                        # rather than its definition (`const Page = lazy(() =>
+                        # import('./Page'))`).  Preserve it for cross-file
+                        # resolution as well; that resolver requires explicit
+                        # module-import evidence before it can choose a target.
+                        raw_calls.append({
+                            "caller_nid": caller_nid,
+                            "callee": component_name,
+                            "is_member_call": False,
+                            "relation": "renders",
+                            "context": "jsx",
+                            "source_file": str_path,
+                            "source_location": f"L{node.start_point[0] + 1}",
+                        })
+            for child in node.children:
+                walk_jsx(child, caller_nid)
+
+        for caller_nid, body_node in function_bodies:
+            walk_jsx(body_node, caller_nid)
+
+        # Browser/client entrypoints frequently render React directly at module
+        # scope (`createRoot(...).render(<AppRouter />)`), outside a named
+        # component function.  Attribute those relations to the file node; a C4
+        # contract may deliberately map that file as an explicit entry point.
+        for statement in root.children:
+            if statement.type == "expression_statement":
+                walk_jsx(statement, file_nid)
+
+        # React route/configuration tables are commonly module-level data, with
+        # the router consuming them later (`routes.map(...)`).  The JSX pass
+        # above intentionally walks function bodies only, so it cannot connect
+        # such a page to the router.  Track JSX component names held by each
+        # top-level binding, then attach them to a function that references the
+        # binding.  This is structural: it works for any configuration name and
+        # still relies on normal cross-file import proof to resolve a lazy alias.
+        module_jsx_bindings: dict[str, set[str]] = {}
+
+        def jsx_names_in(node) -> set[str]:
+            names: set[str] = set()
+            if node.type in ("jsx_opening_element", "jsx_self_closing_element"):
+                name = jsx_component_name(node)
+                if name:
+                    names.add(name)
+            for child in node.children:
+                names.update(jsx_names_in(child))
+            return names
+
+        for statement in root.children:
+            declaration = statement
+            if statement.type == "export_statement":
+                declaration = next(
+                    (child for child in statement.children if child.type in ("lexical_declaration", "variable_declaration")),
+                    statement,
+                )
+            if declaration.type not in ("lexical_declaration", "variable_declaration"):
+                continue
+            for declarator in (child for child in declaration.children if child.type == "variable_declarator"):
+                name_node = declarator.child_by_field_name("name")
+                value_node = declarator.child_by_field_name("value")
+                if name_node is None or value_node is None:
+                    continue
+                names = jsx_names_in(value_node)
+                if names:
+                    module_jsx_bindings[_read_text(name_node, source)] = names
+
+        seen_configuration_render_pairs: set[tuple[str, str]] = set()
+
+        def identifiers_in(node) -> set[str]:
+            identifiers: set[str] = set()
+            if node.type == "identifier":
+                identifiers.add(_read_text(node, source))
+            for child in node.children:
+                identifiers.update(identifiers_in(child))
+            return identifiers
+
+        for caller_nid, body_node in function_bodies:
+            local_names = local_bound_names.get(caller_nid, frozenset())
+            referenced_bindings = identifiers_in(body_node)
+            for binding in referenced_bindings:
+                if binding in local_names:
+                    continue  # a parameter/local shadows the module table
+                for component_name in module_jsx_bindings.get(binding, ()):
+                    pair = (caller_nid, component_name)
+                    if pair in seen_configuration_render_pairs:
+                        continue
+                    seen_configuration_render_pairs.add(pair)
+                    raw_calls.append({
+                        "caller_nid": caller_nid,
+                        "callee": component_name,
+                        "is_member_call": False,
+                        "relation": "renders",
+                        "context": "jsx_configuration",
+                        "source_file": str_path,
+                        "source_location": f"L{body_node.start_point[0] + 1}",
+                    })
 
     # ── Event listener pass ───────────────────────────────────────────────────
     seen_listen_pairs: set[tuple[str, str]] = set()
