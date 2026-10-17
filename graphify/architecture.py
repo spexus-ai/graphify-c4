@@ -37,7 +37,10 @@ LEVEL_TYPES = {
     "component": {"component"},
     "code": {"code"},
 }
-TRUSTED_RESOLUTIONS = frozenset({"same_file", "same_go_package", "go_import", "go_import_type"})
+TRUSTED_RESOLUTIONS = frozenset({
+    "same_file", "same_go_package", "go_import", "go_import_type",
+    "openapi_local_ref", "go_build_variant", "go_package_value", "go_receiver_type",
+})
 ARCHITECTURE_TEXT_FIELDS = ("responsibility", "owner", "trust_boundary", "criticality")
 ARCHITECTURE_LIST_FIELDS = ("data_access", "public_contracts")
 ARCHITECTURE_METADATA_FIELDS = ARCHITECTURE_TEXT_FIELDS + ARCHITECTURE_LIST_FIELDS
@@ -600,6 +603,12 @@ def build_projection(model: dict[str, Any], graph: dict[str, Any]) -> dict[str, 
             "confidence": link.get("confidence", "EXTRACTED"),
             "resolution": link.get("resolution", "unknown"),
         }
+        # Conditional compile edges are facts about a family of valid builds.
+        # Preserve the condition and witness in the C4 inspector; dropping them
+        # would imply mutually exclusive targets execute in the same binary.
+        for field in ('context', 'build_constraint', 'build_witness', 'import_path'):
+            if field in link:
+                evidence[field] = link[field]
         if source in code_node_ids and target in code_node_ids:
             code_key = (code_node_ids[source], code_node_ids[target], relation)
             code_item = observed_code.setdefault(
