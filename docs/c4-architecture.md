@@ -282,3 +282,28 @@ unchanged facts by default, but can show them for context. A historical model
 is ideal; if a common current model is used for both revisions, treat the
 result as a comparable code-to-boundary projection, not proof that the older
 C4 contract existed at that time.
+
+## Source coverage and apparent islands
+
+The source-only pipeline indexes OpenAPI/Swagger YAML roots and local `$ref`
+participants in the scanned file set. Both forward and reverse reference
+participants are retained: a detached path document may reference shared root
+parameters while remaining unreachable from the root used by code generation.
+Use directed root reachability as well as weak connectivity to find these dormant
+contract surfaces. Remote references are not fetched. Ignore rules and sensitive
+file exclusions apply before reference discovery. PyYAML is a runtime dependency;
+only parser nodes and structural references are indexed, not scalar payloads.
+
+Go evidence includes package variables/constants, composite-literal constructions,
+and links from methods to their declared receiver types across files. Build-tag
+alternatives retain a `build_constraint` and a `build_witness`: each witness
+selects exactly one definition in a valid build. The union graph represents
+possible configurations, not simultaneous execution of alternative definitions.
+Boolean proofs are bounded to ten distinct tags; unsupported or ambiguous cases
+remain unresolved. These fields survive C4 projection for inspection.
+
+After upgrading extraction rules, use `graphify extract PATH --code-only --force`
+to rebuild cached per-file facts. Zero graph degree does not prove dead code:
+check executable entry points, build constraints, test consumers, framework
+callbacks, and source coverage before proposing deletion. Cross-repository HTTP
+relations still need explicit contract/configuration evidence in the C4 model.

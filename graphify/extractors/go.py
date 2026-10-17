@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 
+import re
 from pathlib import Path
 from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
 
@@ -83,6 +84,8 @@ def extract_go(path: Path) -> dict:
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
+    build_match = re.search(rb"^//go:build ([^\r\n]+)", source, re.MULTILINE)
+    build_constraint = build_match.group(1).decode().strip() if build_match else ""
     stem = _file_stem(path)
     # Use directory name as package scope so methods on the same type across
     # multiple files in a package share one canonical type node.
@@ -131,6 +134,8 @@ def extract_go(path: Path) -> dict:
         }
         if metadata:
             item["metadata"] = metadata
+        if build_constraint:
+            item.setdefault("metadata", {})["go_build_constraint"] = build_constraint
         nodes.append(item)
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
@@ -393,6 +398,10 @@ def extract_go(path: Path) -> dict:
                 add_node(method_nid, f"{method_name}()", line)
                 add_edge(file_nid, method_nid, "contains", line)
 
+            if receiver_type:
+                raw_type_refs.append(dict(source_nid=method_nid, type_name=receiver_type,
+                                          receiver_type=True, language='go', source_file=str_path,
+                                          source_location=f'L{line}'))
             emit_go_method_refs(node, method_nid, line)
             body = node.child_by_field_name("body")
             if body:
@@ -409,7 +418,9 @@ def extract_go(path: Path) -> dict:
                 type_name = _read_text(name_node, source)
                 line = child.start_point[0] + 1
                 type_nid = _go_type_id(pkg_scope, type_name)
-                add_node(type_nid, type_name, line, type_metadata(type_name))
+                declaration_metadata = dict(type_metadata(type_name) or {})
+                declaration_metadata["go_type_declaration"] = True
+                add_node(type_nid, type_name, line, declaration_metadata)
                 add_edge(file_nid, type_nid, "contains", line)
                 if child.type == "type_alias":
                     alias_target = child.child_by_field_name("type")
@@ -488,6 +499,21 @@ def extract_go(path: Path) -> dict:
                                     type_nid, ref_name, role, "references",
                                     elem.start_point[0] + 1, "generic_arg",
                                 )
+            return
+
+        if t in {'var_declaration', 'const_declaration'}:
+            pending = list(node.named_children)
+            while pending:
+                spec = pending.pop()
+                if spec.type in {'var_spec', 'const_spec'}:
+                    for name_node in spec.children_by_field_name('name'):
+                        name = _read_text(name_node, source)
+                        nid = _make_id(stem, name)
+                        line = name_node.start_point[0]+1
+                        add_node(nid, name, line, {'language': 'go', 'kind': 'variable' if t=='var_declaration' else 'constant'})
+                        add_edge(file_nid, nid, 'contains', line)
+                else:
+                    pending.extend(spec.named_children)
             return
 
         if t == "import_declaration":
@@ -725,9 +751,46 @@ def extract_go(path: Path) -> dict:
 
         visit(body_node)
 
+    local_names_by_caller = {}
+    for caller_nid, body, _ in function_bodies:
+        names = set()
+        pending = [body, body.parent.child_by_field_name('parameters'), body.parent.child_by_field_name('receiver')]
+        while pending:
+            item = pending.pop()
+            if item is None:
+                continue
+            if item.type in {'parameter_declaration', 'variadic_parameter_declaration', 'var_spec', 'const_spec'}:
+                names.update(_read_text(n, source) for n in item.children_by_field_name('name'))
+            if item.type in {'short_var_declaration', 'range_clause'}:
+                lhs = item.child_by_field_name('left')
+                if lhs is not None:
+                    names.update(_read_text(n, source) for n in lhs.named_children if n.type=='identifier')
+            pending.extend(item.named_children)
+        local_names_by_caller[caller_nid] = names
+
     def walk_calls(node, caller_nid: str, local_types: dict[str, str]) -> None:
         if node.type in ("function_declaration", "method_declaration"):
             return
+        if node.type == 'selector_expression':
+            operand = node.child_by_field_name('operand')
+            field = node.child_by_field_name('field')
+            qualifier = _read_text(operand, source) if operand is not None else ''
+            if qualifier in go_imported_pkgs and qualifier not in local_names_by_caller.get(caller_nid, set()) and field is not None:
+                raw_type_refs.append(dict(source_nid=caller_nid, type_name=_read_text(field,source),
+                                          symbol_kind='value', package_qualified=True,
+                                          import_path=go_imported_pkgs[qualifier], language='go',
+                                          source_file=str_path,source_location=f'L{node.start_point[0]+1}'))
+        if node.type == 'identifier':
+            name = _read_text(node,source)
+            if name not in local_names_by_caller.get(caller_nid,set()):
+                raw_type_refs.append(dict(source_nid=caller_nid,type_name=name,symbol_kind='value',
+                                          language='go',source_file=str_path,source_location=f'L{node.start_point[0]+1}'))
+        if node.type == 'composite_literal':
+            type_node = node.child_by_field_name('type')
+            refs = []
+            _go_collect_type_refs(type_node, source, False, refs)
+            for ref_name, role in refs:
+                emit_type_ref(caller_nid, ref_name, role, 'constructs', node.start_point[0]+1, 'composite_literal')
         if node.type == "call_expression":
             func_node = node.child_by_field_name("function")
             callee_name: str | None = None

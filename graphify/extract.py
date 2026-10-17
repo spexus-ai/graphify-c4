@@ -4250,6 +4250,9 @@ def _get_extractor(path: Path) -> Any | None:
     # (#1377). apm.yml would otherwise be a .yml document handled by the LLM.
     if is_package_manifest_path(path):
         return extract_package_manifest
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        from graphify.openapi_ingest import extract_openapi_yaml
+        return extract_openapi_yaml
     # `.h` is C/C++/ObjC-ambiguous; route Objective-C headers to extract_objc
     # (the suffix map sends `.h` to extract_c, which can't read @interface etc.).
     # ObjC sniffing has priority over the C++ sniff: an Objective-C++ header can
@@ -5237,6 +5240,9 @@ def extract(
             sf_rel = sf_path
         nid_to_file_nid[n["id"]] = _file_node_id(sf_rel)
 
+    from graphify.openapi_ingest import resolve_openapi_references
+    resolve_openapi_references(all_nodes, all_edges, root)
+
     existing_pairs = {(e["source"], e["target"]) for e in all_edges}
     existing_relation_pairs = {
         (e["source"], e["target"], str(e.get("relation") or "uses"))
@@ -5289,6 +5295,7 @@ def extract(
         ]
         return candidates[0] if len(candidates) == 1 else None
 
+    go_declaration_ids = {n['id'] for n in all_nodes if n.get('metadata', {}).get('go_type_declaration')}
     def _resolve_go_import_type(raw_type_ref: dict[str, Any]) -> str | None:
         import_path = str(raw_type_ref.get("import_path", ""))
         if not go_module_path or not import_path.startswith(go_module_path + "/"):
@@ -5300,7 +5307,50 @@ def extract(
             and (nid_to_project_dir.get(candidate) or _go_source_dir(nid_to_source_file.get(candidate, "")))
             == package_dir
         ]
+        declared = [c for c in candidates if c in go_declaration_ids]
+        if declared:
+            candidates = declared
         return candidates[0] if len(candidates) == 1 else None
+
+    from graphify.go_build import is_build_partition
+    values_by_name = {}
+    for n in all_nodes:
+        if n.get('metadata', {}).get('kind') in {'variable','constant'} and n.get('source_file', '').endswith('.go'):
+            values_by_name.setdefault(n['label'],[]).append(n)
+    for ref in all_raw_type_refs:
+        if ref.get('symbol_kind') != 'value':
+            continue
+        package_dir = _go_source_dir(ref.get('source_file'))
+        if ref.get('package_qualified'):
+            imported = ref.get('import_path','')
+            if not go_module_path or not imported.startswith(go_module_path+'/'):
+                continue
+            package_dir = imported[len(go_module_path)+1:]
+        targets = [n for n in values_by_name.get(ref['type_name'],[])
+                   if _go_source_dir(n.get('source_file')) == package_dir]
+        constraints = [n.get('metadata',{}).get('go_build_constraint','') for n in targets]
+        if len(targets) != 1 and not is_build_partition(constraints):
+            continue
+        for target in targets:
+            if target['id']==ref['source_nid']:
+                continue
+            edge = dict(source=ref['source_nid'],target=target['id'],relation='references',
+                        confidence='EXTRACTED',resolution='go_package_value',context='value_reference',
+                        source_file=ref['source_file'],source_location=ref['source_location'],weight=1.0)
+            if target.get('metadata',{}).get('go_build_constraint'):
+                edge['build_constraint']=target['metadata']['go_build_constraint']
+            all_edges.append(edge)
+
+    declarations = [n for n in all_nodes if n.get('metadata', {}).get('go_type_declaration')]
+    for ref in all_raw_type_refs:
+        if not ref.get('receiver_type'):
+            continue
+        targets = [n for n in declarations if n.get('label') == ref.get('type_name')
+                   and _go_source_dir(n.get('source_file')) == _go_source_dir(ref.get('source_file'))]
+        if len(targets) == 1:
+            all_edges.append(dict(source=ref['source_nid'],target=targets[0]['id'],relation='references',
+                                  confidence='EXTRACTED',resolution='go_receiver_type',context='receiver_type',
+                                  source_file=ref['source_file'],source_location=ref['source_location'],weight=1.0))
 
     # Type references use the same import proof as qualified function calls.
     # ``jsonrpc.JSONRPCError`` is a dependency on the exact imported local
@@ -5328,6 +5378,8 @@ def extract(
             edge["context"] = raw_type_ref["context"]
         all_edges.append(edge)
 
+    from graphify.go_build import build_variant_witnesses
+    go_constraints = {n["id"]: n.get("metadata", {}).get("go_build_constraint", "") for n in all_nodes}
     for rc in all_raw_calls:
         callee = rc.get("callee", "")
         if not callee:
@@ -5370,6 +5422,20 @@ def extract(
                     "source_location": rc.get("source_location"),
                     "weight": 1.0,
                 })
+            if target is None and go_module_path and rc.get('import_path','').startswith(go_module_path+'/'):
+                package_dir = rc['import_path'][len(go_module_path)+1:]
+                alternatives = [c for c in global_label_to_nids.get(callee,[]) if c in go_callable_nids
+                                and _go_source_dir(nid_to_source_file.get(c,'')) == package_dir]
+                witnesses = build_variant_witnesses([go_constraints.get(c,'') for c in alternatives], go_constraints.get(caller,''))
+                if witnesses is not None:
+                    for alternative, witness in zip(alternatives,witnesses):
+                        if (caller,alternative) in existing_pairs:
+                            continue
+                        existing_pairs.add((caller,alternative))
+                        all_edges.append(dict(source=caller,target=alternative,relation='calls',context='conditional_build',
+                                              confidence='EXTRACTED',resolution='go_build_variant',
+                                              build_constraint=go_constraints[alternative],build_witness=witness,import_path=rc['import_path'],
+                                              source_file=rc.get('source_file',''),source_location=rc.get('source_location'),weight=1.0))
             # A package-qualified Go call has been resolved precisely or is
             # external.  It must never fall through to a corpus-wide name match.
             continue
@@ -5398,6 +5464,26 @@ def extract(
                 or candidate_family == caller_family
             ]
             if not candidates:
+                continue
+        # Keep alternate targets only when each has a witness selecting it
+        # uniquely in a valid build. Preserve the condition and witness so the
+        # union graph does not imply the targets coexist in one binary.
+        if rc.get("language") == "go" and not rc.get("package_qualified"):
+            local = [c for c in candidates if c in go_callable_nids
+                     and _go_source_dir(nid_to_source_file.get(c, "")) == _go_source_dir(rc.get("source_file", ""))]
+            constraints = {c: go_constraints.get(c, '') for c in local}
+            witnesses = build_variant_witnesses(list(constraints.values()), go_constraints.get(rc['caller_nid'],''))
+            if witnesses is not None:
+                for target, witness in zip(local,witnesses):
+                    key = (rc['caller_nid'], target, 'calls')
+                    if key in existing_relation_pairs:
+                        continue
+                    existing_relation_pairs.add(key)
+                    existing_pairs.add(key[:2])
+                    all_edges.append(dict(source=key[0], target=target, relation='calls',
+                                          context='conditional_build', confidence='EXTRACTED',
+                                          resolution='go_build_variant', build_constraint=constraints[target], build_witness=witness,
+                                          source_file=rc.get('source_file', ''), source_location=rc.get('source_location'), weight=1.0))
                 continue
         caller = rc["caller_nid"]
         # Resolve the caller's file via the raw_call's own source_file string,
