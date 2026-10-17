@@ -2567,6 +2567,24 @@ def test_extract_json_config_by_key_probe(tmp_path):
     assert "skipped" not in result
 
 
+def test_extract_json_openapi_contract_is_indexed(tmp_path):
+    """A versioned API description is a contract, not an opaque data fixture."""
+    contract = tmp_path / "swagger.json"
+    contract.write_text(json.dumps({
+        "swagger": "2.0",
+        "info": {"title": "Example API", "version": "1.0"},
+        "paths": {"/health": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "definitions": {"Health": {"type": "object"}},
+    }))
+
+    result = extract_json(contract)
+
+    assert "error" not in result
+    assert "skipped" not in result
+    labels = {node["label"] for node in result["nodes"]}
+    assert {"swagger.json", "swagger", "paths", "/health", "definitions", "Health"} <= labels
+
+
 def test_extract_bash_via_dispatch():
     from graphify.extract import _get_extractor
     assert _get_extractor(Path("foo.sh")) is extract_bash
