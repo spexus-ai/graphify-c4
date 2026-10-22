@@ -1374,6 +1374,13 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
             if ftype != FileType.VIDEO:
                 total_words += _wc(p)
 
+    # Promote only scanned OpenAPI roots and their local $ref closure. Running
+    # after ignore/sensitive filtering prevents references bypassing scan policy.
+    from graphify.openapi_ingest import discover_openapi_yaml
+    contracts = discover_openapi_yaml(files[FileType.DOCUMENT])
+    files[FileType.DOCUMENT] = [p for p in files[FileType.DOCUMENT] if p not in contracts]
+    files[FileType.CODE].extend(sorted(contracts))
+
     for ftype in files:
         files[ftype].sort()
 

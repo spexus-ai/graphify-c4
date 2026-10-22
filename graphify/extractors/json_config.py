@@ -21,19 +21,53 @@ _CONFIG_JSON_KEYS = frozenset({
     "extends", "$ref", "$schema", "compilerOptions",
 })
 
+
+def _is_openapi_document(obj_node, source: bytes) -> bool:
+    """Recognize an OpenAPI/Swagger document without treating generic data as code.
+
+    API descriptions are an executable boundary between independently deployed
+    clients and servers: unlike a fixture or an arbitrary JSON payload, their
+    paths and schemas are useful architectural evidence.  Recognition is kept
+    deliberately narrow: only the version-marker fields prescribed by OpenAPI
+    3 (``openapi``) and Swagger 2 (``swagger``) qualify.  A filename alone is
+    not enough because repositories often keep response dumps named
+    ``swagger.json`` alongside the real contract.
+    """
+    for top_key in obj_node.children:
+        if top_key.type != "pair":
+            continue
+        key_node = top_key.child_by_field_name("key")
+        value_node = top_key.child_by_field_name("value")
+        if key_node is None or value_node is None:
+            continue
+        content = key_node.child_by_field_name("string_content")
+        key = _read_text(content, source) if content else _read_text(key_node, source).strip('"\'')
+        if key not in {"openapi", "swagger"}:
+            continue
+        if value_node.type != "string":
+            continue
+        version_node = value_node.child_by_field_name("string_content")
+        version = (_read_text(version_node, source) if version_node else _read_text(value_node, source).strip('"\''))
+        if (key == "openapi" and version.startswith("3.")) or (key == "swagger" and version == "2.0"):
+            return True
+    return False
+
 def _is_config_json(path: Path, obj_node, source: bytes) -> bool:
     """True if a .json file is a recognized config/manifest worth AST-extracting.
 
     Matches by filename first (cheap), then falls back to a top-level key probe
     so arbitrarily-named config files (e.g. ``api.tsconfig.json``,
-    ``foo.eslintrc.json``) are still picked up. Returns False for data JSON so it
-    is skipped by the structural pass (#1224)."""
+    ``foo.eslintrc.json``) are still picked up.  OpenAPI/Swagger descriptions
+    are also indexed because they form an explicit API contract. Returns False
+    for other data JSON so it is skipped by the structural pass (#1224)."""
     name = path.name.casefold()
     if name in _CONFIG_JSON_NAMES:
         return True
     # Common compound config names: *.eslintrc.json, *.prettierrc.json, etc.
     if name.endswith((".eslintrc.json", ".prettierrc.json", ".babelrc.json",
                       "tsconfig.json", "jsconfig.json")):
+        return True
+    if _is_openapi_document(obj_node, source):
         return True
     # Top-level key probe: scan the root object's immediate keys (no deep walk).
     for top_key in obj_node.children:

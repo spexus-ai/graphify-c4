@@ -40,6 +40,10 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify query "<question>" --budget 1500            # cap answer at N tokens
 /graphify path "AuthModule" "Database"                # shortest path between two concepts
 /graphify explain "SwinTransformer"                   # plain-language explanation of a node
+/graphify architecture init                            # create a versioned single-repository C4 contract
+/graphify architecture workspace init --repo web=web --repo api=services/api  # create a portable multi-repo C4 starter
+/graphify architecture workspace sync --model architecture/graphify.workspace.c4.json --root .  # compose repository graphs
+/graphify architecture workspace html --model architecture/graphify.workspace.c4.json --root .  # write an interactive C4 view
 ```
 
 ## What graphify is for
@@ -51,6 +55,12 @@ Drop any folder of code, docs, papers, images, or video into graphify and get a 
 If the user invoked `/graphify --help` or `/graphify -h` (with no other arguments), print the contents of the `## Usage` section above verbatim and stop. Do not run any commands, do not detect files, do not default the path to `.`. Just print the Usage block and return.
 
 **Fast path — existing graph:** Before doing anything else, check whether `graphify-out/graph.json` exists. The expected location is `graphify-out/graph.json` relative to the **current working directory** (i.e. the project root where you are running commands). If it exists AND the user's request is a natural-language question about the codebase (e.g. "How does X work?", "What calls Y?", "Trace the data flow through Z") and NOT an explicit rebuild command (`--update`, `--cluster-only`, or a bare path/URL that implies fresh extraction): **skip Steps 1–5 entirely and jump straight to `## For /graphify query`.** Run `graphify query "<question>"` immediately. Do not run detect. Do not check corpus size. Do not ask the user to narrow. The graph is already built — use it.
+
+**Architecture mode — C4 hierarchy and conformance:** If the user asks about architecture boundaries, complexity, C4, component ownership, dependency rules, or the impact of a change across modules, use a declared C4 contract rather than inferring systems from clusters. For one repository, check for `architecture/graphify.c4.json`; when it exists, run `graphify architecture dependencies` to resolve each observed dependency as `denied`, `declared`, or `undeclared`, then run `graphify architecture validate` and `graphify architecture audit --suspect`. Use the smallest relevant `view`, `up`, `down`, or `impact` command, and `graphify architecture html` for the interactive browser view.
+
+For a workspace with independently extracted repositories, first check for `architecture/graphify.workspace.c4.json` (or another model containing `repositories`). If it exists, ensure each listed repository has its local `graphify-out/graph.json`, then run `graphify architecture workspace sync --model architecture/graphify.workspace.c4.json --root .` or `workspace html` to compose the Context, Container, Component, and Code levels. If graphs are missing, extract each repository separately with `graphify extract REPOSITORY_PATH --out REPOSITORY_PATH --code-only`. Keep cross-repository HTTP, message, CLI, and datastore boundaries as declared relations; never invent an implementation edge between repositories. If no workspace model exists, offer `graphify architecture workspace init --repo ID=RELATIVE_PATH` and explain that its broad initial components must be refined into reviewed architectural boundaries.
+
+**Component-first discussion protocol:** For a technical architecture question, start from the complete Component projection, not an isolated topic subgraph. Open `graphify architecture html` at Component level; use Highlight only to emphasize selected components and their direct relationships while keeping the rest of the system visible. Before a conclusion, report **Graph facts**, **Uncertainties**, **Decision**, and **Full-graph impact**. Use `up`, `down`, `impact`, `dependencies`, `validate`, and `audit --suspect` to substantiate claims. Start at Context only for actor/external-system questions and at Container only for cross-runtime/deployment questions; move to Components before making a technical design conclusion.
 
 If no path was given, use `.` (current directory). Do not ask the user for a path.
 
